@@ -894,7 +894,7 @@ def test_complex_example(visualize=False):
     print(f"\nStarts: {starts}")
     print(f"Goals:  {goals}")
     
-    # Test LaCAM only (PIBT might struggle with this)
+    # Test LaCAM only
     print("\nRunning LaCAM...")
     start_time = time.time()
     lacam = LaCAM(graph, starts, goals)
@@ -1047,7 +1047,7 @@ def test_benchmark_scenario(map_path: str, scen_path: str, num_agents: int = 10,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='LaCAM with PIBT - MAPF (OPTIMIZED WITH LAZY BACKWARD BFS)',
+        description='LaCAM with PIBT - MAPF (OPTIMIZED Version)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
