@@ -7,21 +7,22 @@ import argparse
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib import colors
+import os
 
-Vertex = Tuple[int, int]  #(row, col)
-Configuration = Tuple[Vertex, ...]  #tuple of all agent locations
+Vertex = Tuple[int, int]  # (row, col)
+Configuration = Tuple[Vertex, ...]  # tuple of all agent locations
 AgentID = int
 Path = List[Vertex]
 
-#GRAPH CLASS
+# GRAPH CLASS
 
 class Graph:    
     def __init__(self, grid_map: np.ndarray):
         self.grid_map = grid_map
         self.height, self.width = grid_map.shape
         
-        # precompute distance tables for efficiency
-        self.distance_cache = {}
+        # Store backward distances from goals
+        self.goal_distances = {}  # goal -> {position: distance}
     
     def neighbors(self, v: Vertex) -> List[Vertex]:
         row, col = v
@@ -37,39 +38,31 @@ class Graph:
         return neighbors
     
     def get_distance(self, start: Vertex, goal: Vertex) -> int:
-        key = (start, goal)
-        if key in self.distance_cache:
-            return self.distance_cache[key]
-        
+        # Get distance using cached backward BFS from goal
         if start == goal:
             return 0
         
-        # bfs
-        queue = deque([(start, 0)])
-        visited = {start}
+        # If we haven't computed distances for this goal yet, do it now
+        if goal not in self.goal_distances:
+            self._compute_all_distances_from_goal(goal)
         
-        while queue:
+        return self.goal_distances[goal].get(start, float('inf'))
+    
+    def _compute_all_distances_from_goal(self, goal: Vertex):
+        # Backward BFS from goal to ALL reachable vertices, called once per goal, caches everything
+        distances = {goal: 0}
+        queue = deque([(goal, 0)])
+        
+        while queue:  # No early stopping
             current, dist = queue.popleft()
             
             for neighbor in self.neighbors(current):
-                if neighbor == goal:
-                    self.distance_cache[key] = dist + 1
-                    return dist + 1
-                
-                if neighbor not in visited:
-                    visited.add(neighbor)
+                if neighbor not in distances:
+                    distances[neighbor] = dist + 1
                     queue.append((neighbor, dist + 1))
         
-        # no path exists
-        return float('inf')
-    
-    def precompute_distances(self, vertices: List[Vertex]):
-        
-        #pairwise distances for given vertices
-        for i, v1 in enumerate(vertices):
-            for v2 in vertices[i:]:
-                self.get_distance(v1, v2)
-                self.get_distance(v2, v1)
+        # Cache ALL distances for this goal
+        self.goal_distances[goal] = distances
 
 
 # PIBT IMPLEMENTATION
@@ -77,55 +70,77 @@ class Graph:
 class PIBT:
     def __init__(self, graph: Graph, starts: List[Vertex], goals: List[Vertex]):
         self.graph = graph
-        self.starts = starts
-        self.goals = goals
         self.num_agents = len(starts)
+        
+        # Convert to NumPy arrays (N, 2)
+        self.starts = np.array(starts, dtype=np.int32)
+        self.goals = np.array(goals, dtype=np.int32)
+        
+        # No precomputation needed - distances computed lazily on first query
         
         # tie breaker
         self.priorities = np.array([i * 0.001 for i in range(self.num_agents)])
         
-        self.current_locs = list(starts)
+        # NumPy arrays for locations (N, 2)
+        self.current_locs = self.starts.copy()
+        self.next_locs = np.full((self.num_agents, 2), -1, dtype=np.int32)  # -1 = unassigned
         
-        self.next_locs = [None] * self.num_agents
+        # Occupancy maps for fast conflict checking
+        self.occupied_current = np.full((graph.height, graph.width), -1, dtype=np.int32)
+        self.occupied_next = np.full((graph.height, graph.width), -1, dtype=np.int32)
     
+    def _update_occupancy_current(self):
+        # Update the occupancy map for current locations
+        self.occupied_current.fill(-1)
+        for agent_id in range(self.num_agents):
+            r, c = self.current_locs[agent_id]
+            self.occupied_current[r, c] = agent_id
+    
+    def _update_occupancy_next(self):
+        # Update the occupancy map for next locations
+        self.occupied_next.fill(-1)
+        for agent_id in range(self.num_agents):
+            if self.next_locs[agent_id, 0] != -1:  # if assigned
+                r, c = self.next_locs[agent_id]
+                self.occupied_next[r, c] = agent_id
     
     def solve(self, max_timesteps: int = 1000) -> Optional[List[List[Vertex]]]:
-
-        solution = [[loc] for loc in self.starts]
+        solution = [[tuple(loc)] for loc in self.starts]
         
         for timestep in range(max_timesteps):
-            # check if all agents reached goals
-            if all(self.current_locs[i] == self.goals[i] for i in range(self.num_agents)):
+            # Check if all agents reached goals
+            if np.all(np.all(self.current_locs == self.goals, axis=1)):
                 return solution
             
             if not self.plan_one_timestep():
                 return None  # failed
             
             # move agents
-            self.current_locs = self.next_locs[:]
+            self.current_locs = self.next_locs.copy()
             for i in range(self.num_agents):
-                solution[i].append(self.current_locs[i])
+                solution[i].append(tuple(self.current_locs[i]))
         
         return None 
     
     def plan_one_timestep(self) -> bool:
-        
-        # update priorities (line3)
+        # update priorities
         for i in range(self.num_agents):
-            if self.current_locs[i] != self.goals[i]:
+            if not np.array_equal(self.current_locs[i], self.goals[i]):
                 self.priorities[i] += 1
             else:
                 self.priorities[i] = i * 0.001  # reset with tie-breaker
         
-        # sort agents by priority (line4)
+        # sort agents by priority
         agent_order = np.argsort(-self.priorities)
         
-        # initialize next loc
-        self.next_locs = [None] * self.num_agents
+        # initialize next loc (N, 2) array with -1
+        self.next_locs.fill(-1)
+        self.occupied_next.fill(-1)
+        self._update_occupancy_current()
         
-        # plan for each agent (lines 5-7)
+        # plan for each agent
         for agent_id in agent_order:
-            if self.next_locs[agent_id] is None:
+            if self.next_locs[agent_id, 0] == -1:  # not assigned yet
                 success = self._pibt_recursive(agent_id, None)
                 if not success:
                     return False 
@@ -133,84 +148,77 @@ class PIBT:
         return True
     
     def _pibt_recursive(self, agent_id: AgentID, blocked_by: Optional[AgentID]) -> bool:
+        current_pos = tuple(self.current_locs[agent_id])
+        goal = tuple(self.goals[agent_id])
         
-        current_pos = self.current_locs[agent_id]
-        goal = self.goals[agent_id]
-        
-        # get candidate nodes (line9)
+        # Get candidate nodes
         candidates = self.graph.neighbors(current_pos) + [current_pos]
         
-        # sort by distance to goal (line10)
-        # prefr unoccupied vertices to avoid unnecessary PI
-
+        # Sort by distance to goal using precomputed distances
+        # Check occupancy using occupancy map
         candidates.sort(key=lambda v: (
             self.graph.get_distance(v, goal),
-            any(self.current_locs[k] == v for k in range(self.num_agents))
+            self.occupied_current[v] != -1  # True if occupied (moves occupied to end)
         ))
         
-        #try each candidate (lines 11-19)
+        # Try each candidate
         for candidate in candidates:
-            # check vertex conflict (line12)
-            if any(self.next_locs[k] == candidate for k in range(self.num_agents)):
+            # Check vertex conflict using occupancy map
+            if self.occupied_next[candidate] != -1:
                 continue
             
-            # check swap conflict (line13)
-            if blocked_by is not None and self.current_locs[blocked_by] == candidate:
-                continue
+            # Check swap conflict
+            if blocked_by is not None:
+                blocked_pos = tuple(self.current_locs[blocked_by])
+                if blocked_pos == candidate:
+                    continue
             
-            # Reserve this location (Line 14)
-            self.next_locs[agent_id] = candidate
+            # Reserve this location
+            self.next_locs[agent_id] = np.array(candidate, dtype=np.int32)
+            self.occupied_next[candidate] = agent_id
             
-            # Check if another agent occupies this location (Line 15)
-            conflicting_agent = None
-            for k in range(self.num_agents):
-                if (k != agent_id and 
-                    self.current_locs[k] == candidate and 
-                    self.next_locs[k] is None):
-                    conflicting_agent = k
-                    break
+            # Check if another agent occupies this location using occupancy map
+            conflicting_agent = self.occupied_current[candidate]
             
-            if conflicting_agent is not None:
-                # Priority inheritance (Line 16)
+            if (conflicting_agent != -1 and 
+                conflicting_agent != agent_id and 
+                self.next_locs[conflicting_agent, 0] == -1):  # Not yet assigned
+                
+                # Priority inheritance - recursive call
                 if not self._pibt_recursive(conflicting_agent, agent_id):
-                    continue  # Failed, try next candidate
+                    # Failed, unreserve and try next candidate
+                    self.occupied_next[candidate] = -1
+                    self.next_locs[agent_id] = np.array([-1, -1], dtype=np.int32)
+                    continue
             
-            # Success! (Line 18)
+            # Success
             return True
         
-        # No valid move found (Lines 20-21)
-        self.next_locs[agent_id] = current_pos
+        # No valid move found - stay in place
+        self.next_locs[agent_id] = self.current_locs[agent_id].copy()
+        self.occupied_next[current_pos] = agent_id
         return False
 
 
 # LaCAM IMPLEMENTATION
 
-
 class LaCAM:
-    """
-    Lazy Constraints Addition Search for MAPF
-    Based on Algorithm 1 from the LaCAM paper
-    
-    KEY: Uses full PIBT (with priority inheritance and backtracking) 
-         for configuration generation
-    """
-    
     class Constraint:
-        """Low-level constraint node"""
+        # low-level constraint node
         def __init__(self, parent: Optional['LaCAM.Constraint'], 
                      who: Optional[AgentID], where: Optional[Vertex]):
             self.parent = parent
-            self.who = who  # Which agent
-            self.where = where  # Must go to which vertex
+            self.who = who  # which agent
+            self.where = where  # must go to which vertex
         
         def depth(self) -> int:
-            """Get depth in constraint tree"""
+            # Get depth in the tree
             if self.parent is None:
                 return 0
             return 1 + self.parent.depth()
         
         def get_constraints(self) -> Dict[AgentID, Vertex]:
-            """Extract all constraints from root to this node"""
+            # Extract all constraints from root to this node
             constraints = {}
             current = self
             while current is not None and current.who is not None:
@@ -219,15 +227,15 @@ class LaCAM:
             return constraints
     
     class HighLevelNode:
-        """High-level search node"""
+        # high-level search node
         def __init__(self, config: Configuration, order: List[AgentID], 
                      parent: Optional['LaCAM.HighLevelNode']):
             self.config = config
-            self.order = order  # Agent ordering for constraint generation
+            self.order = order  # agent ordering for constraint generation
             self.parent = parent
-            self.tree = deque()  # Queue of constraints (BFS)
+            self.tree = deque()  # queue of constraints (BFS)
             
-            # Initialize with root constraint
+            # initialize with root constraint
             self.tree.append(LaCAM.Constraint(parent=None, who=None, where=None))
     
     def __init__(self, graph: Graph, starts: List[Vertex], goals: List[Vertex]):
@@ -236,20 +244,13 @@ class LaCAM:
         self.goals = tuple(goals)
         self.num_agents = len(starts)
         
+        # no precomputation needed - distances computed lazily on first query
+        
         # PIBT-based configuration generator
         self.config_generator = PIBTConfigGenerator(graph, starts, goals)
+
     
     def solve(self, node_limit: int = 100000, time_limit: float = 30.0) -> Optional[List[List[Vertex]]]:
-        """
-        Solve MAPF using LaCAM
-        
-        Args:
-            node_limit: Maximum number of high-level nodes to generate
-            time_limit: Maximum time in seconds
-        
-        Returns:
-            List of paths for each agent, or None if failed
-        """
         start_time = time.time()
         
         # Initialize (Lines 1-3)
@@ -279,7 +280,8 @@ class LaCAM:
             if node.config == self.goals:
                 print(f"LaCAM success! Depth: {self._get_depth(node)}, "
                       f"Nodes expanded: {nodes_expanded}, generated: {nodes_generated}")
-                return self._backtrack(node)
+                solution = self._backtrack(node)
+                return solution
             
             # Check if node exhausted (Line 7)
             if not node.tree:
@@ -322,10 +324,10 @@ class LaCAM:
             
             # Check if already explored (Line 16)
             if new_config in explored:
-                # Optional: Reinsert existing node to improve solution quality
+                # reinsert existing node to improve solution quality
                 existing_node = explored[new_config]
-                if existing_node not in open_list:
-                    open_list.append(existing_node)
+                # if existing_node not in open_list:
+                open_list.append(existing_node)
                 continue
             
             # Create new high-level node (Line 17)
@@ -341,14 +343,12 @@ class LaCAM:
         return None
     
     def _get_initial_order(self) -> List[AgentID]:
-
         # get initial agent ordering, order by distance to goal - desc, agents with longer paths should have higher priority
         distances = [self.graph.get_distance(self.starts[i], self.goals[i]) 
                     for i in range(self.num_agents)]
         return list(np.argsort(distances)[::-1])
     
     def _get_order(self, config: Configuration) -> List[AgentID]:
-
         # priority rule from section 3.3
         not_at_goal = []
         at_goal = []
@@ -393,16 +393,36 @@ class PIBTConfigGenerator:
     
     def __init__(self, graph: Graph, starts: List[Vertex], goals: List[Vertex]):
         self.graph = graph
-        self.goals = goals
         self.num_agents = len(goals)
         
-        # Priority values (updated during generation)
+        self.goals = np.array(goals, dtype=np.int32)
+        
+        # priorty values (updated during generation)
         self.priorities = np.zeros(self.num_agents)
         
-        # Working memory for configuration generation
-        self.current_locs = None
-        self.next_locs = None
+        self.current_locs = None  # (N, 2) array
+        self.next_locs = None  # (N, 2) array
         self.constrained_agents = None
+        
+        # Occupancy maps
+        self.occupied_current = np.full((graph.height, graph.width), -1, dtype=np.int32)
+        self.occupied_next = np.full((graph.height, graph.width), -1, dtype=np.int32)
+    
+    def _update_occupancy_current(self):
+        # Update the occupancy map for current locations
+        self.occupied_current.fill(-1)
+        for agent_id in range(self.num_agents):
+            if self.current_locs[agent_id, 0] != -1:
+                r, c = self.current_locs[agent_id]
+                self.occupied_current[r, c] = agent_id
+    
+    def _update_occupancy_next(self):
+        # update the occupancy map for next locations
+        self.occupied_next.fill(-1)
+        for agent_id in range(self.num_agents):
+            if self.next_locs[agent_id, 0] != -1:
+                r, c = self.next_locs[agent_id]
+                self.occupied_next[r, c] = agent_id
     
     def generate(self, current_config: Configuration, 
                  constraint: LaCAM.Constraint) -> Optional[Configuration]:
@@ -410,19 +430,22 @@ class PIBTConfigGenerator:
         # Extract constraints
         constraints_dict = constraint.get_constraints()
         
-        # Initialize state
-        self.current_locs = list(current_config)
-        self.next_locs = [None] * self.num_agents
+        # OPTIMIZED: Initialize state with NumPy arrays
+        self.current_locs = np.array(current_config, dtype=np.int32)
+        self.next_locs = np.full((self.num_agents, 2), -1, dtype=np.int32)
         self.constrained_agents = set(constraints_dict.keys())
         
         # Pre-assign constrained agents
         for agent_id, vertex in constraints_dict.items():
-            self.next_locs[agent_id] = vertex
+            self.next_locs[agent_id] = np.array(vertex, dtype=np.int32)
+        
+        # Update occupancy maps
+        self._update_occupancy_current()
+        self._update_occupancy_next()
         
         # Update priorities for PIBT
-        # Agents not at goal should have higher priority
         for i in range(self.num_agents):
-            if self.current_locs[i] != self.goals[i]:
+            if not np.array_equal(self.current_locs[i], self.goals[i]):
                 self.priorities[i] = 100.0 + i * 0.001  # High priority
             else:
                 self.priorities[i] = i * 0.001  # Low priority
@@ -435,7 +458,7 @@ class PIBTConfigGenerator:
             if agent_id in self.constrained_agents:
                 continue  # Already assigned by constraint
             
-            if self.next_locs[agent_id] is None:
+            if self.next_locs[agent_id, 0] == -1:  # Not assigned
                 # THIS IS THE KEY: Call full PIBT recursive procedure
                 success = self._pibt_recursive(agent_id, None)
                 if not success:
@@ -443,66 +466,70 @@ class PIBTConfigGenerator:
         
         # Verify all constraints satisfied
         for agent_id, required_vertex in constraints_dict.items():
-            if self.next_locs[agent_id] != required_vertex:
+            if not np.array_equal(self.next_locs[agent_id], np.array(required_vertex)):
                 return None  # Constraint violated
         
-        # Verify no conflicts
-        if len(set(self.next_locs)) != len(self.next_locs):
+        # Verify no conflicts (all locations unique)
+        next_locs_tuple = [tuple(loc) for loc in self.next_locs]
+        if len(set(next_locs_tuple)) != len(next_locs_tuple):
             return None  # Vertex conflict
         
-        return tuple(self.next_locs)
+        return tuple(next_locs_tuple)
     
     def _pibt_recursive(self, agent_id: AgentID, blocked_by: Optional[AgentID]) -> bool:
         # if this agent is constrained, it's already assigned
         if agent_id in self.constrained_agents:
             return True
         
-        current_pos = self.current_locs[agent_id]
-        goal = self.goals[agent_id]
+        current_pos = tuple(self.current_locs[agent_id])
+        goal = tuple(self.goals[agent_id])
         
-        # Get candidate nodes (line9)
+        # Get candidate nodes
         candidates = self.graph.neighbors(current_pos) + [current_pos]
         
-        # Sort by distance to goal (line10)
-        # Tie-break: prefer unoccupied to avoid unnecessary priority inheritance
+        # OPTIMIZED: Sort by distance to goal using precomputed distances
         candidates.sort(key=lambda v: (
             self.graph.get_distance(v, goal),
-            any(self.current_locs[k] == v for k in range(self.num_agents))
+            self.occupied_current[v] != -1  # Prefer unoccupied
         ))
         
-        # Try each candidate (lines 11-19)
+        # Try each candidate
         for candidate in candidates:
-            # Check vertex conflict (line12)
-            if any(self.next_locs[k] == candidate for k in range(self.num_agents)):
+            # OPTIMIZED: Check vertex conflict using occupancy map
+            if self.occupied_next[candidate] != -1:
                 continue
             
-            # Check swap conflict (line13)
-            if blocked_by is not None and self.current_locs[blocked_by] == candidate:
-                continue
+            # Check swap conflict
+            if blocked_by is not None:
+                blocked_pos = tuple(self.current_locs[blocked_by])
+                if blocked_pos == candidate:
+                    continue
             
-            # Reserve this location (line14)
-            self.next_locs[agent_id] = candidate
+            # Reserve this location
+            self.next_locs[agent_id] = np.array(candidate, dtype=np.int32)
+            self.occupied_next[candidate] = agent_id
             
-            # Check if another agent occupies this location (line15)
-            conflicting_agent = None
-            for k in range(self.num_agents):
-                if (k != agent_id and 
-                    self.current_locs[k] == candidate and 
-                    self.next_locs[k] is None and
-                    k not in self.constrained_agents):  # Don't try to move constrained agents!
-                    conflicting_agent = k
-                    break
+            # OPTIMIZED: Check if another agent occupies this location
+            conflicting_agent = self.occupied_current[candidate]
             
-            if conflicting_agent is not None:
-                # Priority inheritance - RECURSIVE CALL (line16)
+            if (conflicting_agent != -1 and 
+                conflicting_agent != agent_id and 
+                self.next_locs[conflicting_agent, 0] == -1 and
+                conflicting_agent not in self.constrained_agents):  # Don't move constrained agents!
+                
+                # Priority inheritance - RECURSIVE CALL
                 if not self._pibt_recursive(conflicting_agent, agent_id):
-                    continue  #try next candidate
+                    # Failed, unreserve and try next candidate
+                    self.occupied_next[candidate] = -1
+                    self.next_locs[agent_id] = np.array([-1, -1], dtype=np.int32)
+                    continue
             
-            # success! (line18)
+            # success!
             return True
         
-        # no valid (lines 20-21)
-        self.next_locs[agent_id] = current_pos
+        # no valid move - stay in place
+        self.next_locs[agent_id] = self.current_locs[agent_id].copy()
+        self.occupied_next[current_pos] = agent_id
         return False
 
 
@@ -521,6 +548,75 @@ def create_grid_from_string(grid_str: str) -> np.ndarray:
                 grid[i, j] = 1  # Obstacle
     
     return grid
+
+def load_map_file(map_path: str) -> np.ndarray:
+    with open(map_path, 'r') as f:
+        lines = f.readlines()
+    
+    # Parse header
+    header = {}
+    map_start_idx = 0
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if line.startswith('type'):
+            header['type'] = line.split()[1]
+        elif line.startswith('height'):
+            header['height'] = int(line.split()[1])
+        elif line.startswith('width'):
+            header['width'] = int(line.split()[1])
+        elif line.startswith('map'):
+            map_start_idx = i + 1
+            break
+    
+    height = header['height']
+    width = header['width']
+    
+    # Parse map
+    grid_map = np.zeros((height, width), dtype=int)
+    for i in range(height):
+        line = lines[map_start_idx + i].strip()
+        for j, char in enumerate(line):
+            if char in ['@', 'O', 'T', 'W']:  # Obstacles
+                grid_map[i, j] = 1
+            # '.' and 'G' are passable (0)
+    
+    return grid_map
+
+
+def load_scenario_file(scen_path: str, num_agents: int = None) -> Tuple[str, List[Vertex], List[Vertex]]:
+    with open(scen_path, 'r') as f:
+        lines = f.readlines()
+    
+    starts = []
+    goals = []
+    map_name = None
+    
+    for line in lines[1:]:  # Skip version line
+        if not line.strip():
+            continue
+        
+        parts = line.strip().split()
+        if len(parts) < 9:
+            continue
+        
+        # Parse scenario line
+        # bucket, map_file, width, height, start_col, start_row, goal_col, goal_row, optimal_length
+        if map_name is None:
+            map_name = parts[1]
+        
+        start_col = int(parts[4])
+        start_row = int(parts[5])
+        goal_col = int(parts[6])
+        goal_row = int(parts[7])
+        
+        starts.append((start_row, start_col))
+        goals.append((goal_row, goal_col))
+        
+        # Limit number of agents if specified
+        if num_agents is not None and len(starts) >= num_agents:
+            break
+    
+    return map_name, starts, goals
 
 def visualize_solution(grid_map: np.ndarray, solution: List[List[Vertex]], 
                        starts: List[Vertex], goals: List[Vertex]):
@@ -594,7 +690,35 @@ def calculate_costs(solution: List[List[Vertex]], goals: List[Vertex]) -> Tuple[
     
     return sum_of_costs, makespan
 
-
+def save_solution_to_file(solution: List[List[Vertex]], filepath: str, 
+                         map_path: str = None, goals: List[Vertex] = None):
+    if solution is None:
+        print(f"No solution to save to {filepath}")
+        return
+    
+    num_agents = len(solution)
+    
+    with open(filepath, 'w') as f:
+        # Write map name if provided
+        if map_path:
+            f.write(f"Map_name: {map_path}\n")
+        
+        # Write number of agents
+        f.write(f"Num_agents: {num_agents}\n")
+        
+        # Write goals if provided
+        if goals:
+            for agent_id, goal in enumerate(goals):
+                f.write(f"Goal_for_agent {agent_id}: ({goal[0]},{goal[1]})\n")
+        
+        # Write paths
+        for agent_id, path in enumerate(solution):
+            # Format: Agent 0: (row,col)->(row,col)->
+            path_str = '->'.join([f"({v[0]},{v[1]})" for v in path])
+            path_str += '->'  # Add trailing arrow
+            f.write(f"Agent {agent_id}: {path_str}\n")
+    
+    print(f"Solution saved to: {filepath}")
 
 #TESTS
 def animate_solution_simple(grid_map: np.ndarray, solution: List[List[Vertex]], 
@@ -676,10 +800,6 @@ def test_simple_example(visualize=False):
     starts = [(1, 1), (8, 8), (1, 8), (8, 1)]
     goals = [(8, 8), (1, 1), (8, 1), (1, 8)]
     
-    # Precompute distances
-    all_vertices = starts + goals
-    graph.precompute_distances(all_vertices)
-    
     print("\nGrid map (# = obstacle):")
     for i in range(grid_map.shape[0]):
         row = []
@@ -698,13 +818,17 @@ def test_simple_example(visualize=False):
     print(f"Goals:  {goals}")
     
     # Test PIBT
+    print("\n" + "="*50)
     print("Running PIBT...")
+    start_time = time.time()
     pibt = PIBT(graph, starts, goals)
     pibt_solution = pibt.solve(max_timesteps=100)
+    pibt_time = time.time() - start_time
     
     if pibt_solution:
         soc, makespan = calculate_costs(pibt_solution, goals)
         print(f"✓ PIBT SUCCESS!")
+        print(f"  Time: {pibt_time:.4f}s")
         print(f"  Timesteps: {len(pibt_solution[0])}")
         print(f"  Sum-of-costs: {soc}")
         print(f"  Makespan: {makespan}")
@@ -712,13 +836,17 @@ def test_simple_example(visualize=False):
         print("✗ PIBT FAILED")
     
     # Test LaCAM
+    print("\n" + "="*50)
     print("Running LaCAM...")
+    start_time = time.time()
     lacam = LaCAM(graph, starts, goals)
     lacam_solution = lacam.solve(node_limit=10000, time_limit=10.0)
+    lacam_time = time.time() - start_time
     
     if lacam_solution:
         soc, makespan = calculate_costs(lacam_solution, goals)
-        print(f"LaCAM SUCCESS!")
+        print(f"✓ LaCAM SUCCESS!")
+        print(f"  Time: {lacam_time:.4f}s")
         print(f"  Timesteps: {len(lacam_solution[0])}")
         print(f"  Sum-of-costs: {soc}")
         print(f"  Makespan: {makespan}")
@@ -736,7 +864,7 @@ def test_simple_example(visualize=False):
 
 
 def test_complex_example(visualize=False):
-    print("TEST 2: Complex 15x15 maze with 6 agents")
+    print("\nTEST 2: Complex 15x15 maze with 6 agents")
     
     grid_str = """
     ...............
@@ -767,13 +895,16 @@ def test_complex_example(visualize=False):
     print(f"Goals:  {goals}")
     
     # Test LaCAM only (PIBT might struggle with this)
-    print("Running LaCAM...")
+    print("\nRunning LaCAM...")
+    start_time = time.time()
     lacam = LaCAM(graph, starts, goals)
     lacam_solution = lacam.solve(node_limit=50000, time_limit=30.0)
+    lacam_time = time.time() - start_time
     
     if lacam_solution:
         soc, makespan = calculate_costs(lacam_solution, goals)
-        print(f" LaCAM SUCCESS!")
+        print(f"✓ LaCAM SUCCESS!")
+        print(f"  Time: {lacam_time:.4f}s")
         print(f"  Timesteps: {len(lacam_solution[0])}")
         print(f"  Sum-of-costs: {soc}")
         print(f"  Makespan: {makespan}")
@@ -791,7 +922,7 @@ def test_complex_example(visualize=False):
 
 
 def test_dense_scenario(visualize=False):
-    print("TEST 3: Dense scenario - 8 agents in 8x8 grid")
+    print("\nTEST 3: Dense scenario - 8 agents in 8x8 grid")
     
     grid_map = np.zeros((8, 8), dtype=int)
     graph = Graph(grid_map)
@@ -803,69 +934,207 @@ def test_dense_scenario(visualize=False):
     print(f"\nStarts: {starts}")
     print(f"Goals:  {goals}")
     
-    print("Running LaCAM...")
+    print("\nRunning LaCAM...")
+    start_time = time.time()
     lacam = LaCAM(graph, starts, goals)
     lacam_solution = lacam.solve(node_limit=100000, time_limit=30.0)
+    lacam_time = time.time() - start_time
     
     if lacam_solution:
         soc, makespan = calculate_costs(lacam_solution, goals)
-        print(f"LaCAM SUCCESS!")
-        print(f"Timesteps: {len(lacam_solution[0])}")
-        print(f"Sum-of-costs: {soc}")
-        print(f"Makespan: {makespan}")
+        print(f"✓ LaCAM SUCCESS!")
+        print(f"  Time: {lacam_time:.4f}s")
+        print(f"  Timesteps: {len(lacam_solution[0])}")
+        print(f"  Sum-of-costs: {soc}")
+        print(f"  Makespan: {makespan}")
         
         # Visualize if requested
         if visualize:
             print("\nOpening visualization window...")
-            print(" (Close window to continue)")
+            print("   (Close window to continue)")
             animate_solution_simple(grid_map, lacam_solution, starts, goals)
         
         return (grid_map, lacam_solution, starts, goals)
     else:
-        print("LaCAM FAILED")
+        print("✗ LaCAM FAILED")
         return None
+    
+
+def test_benchmark_scenario(map_path: str, scen_path: str, num_agents: int = 10, 
+                           visualize: bool = False, algorithm: str = 'lacam', save_solution: bool = True):
+
+    os.makedirs('data/logs', exist_ok=True)
+    os.makedirs('data/logs/tmpImages', exist_ok=True)
+
+    print(f"\nTEST: Benchmark Scenario")
+    print(f"Map: {map_path}")
+    print(f"Scenario: {scen_path}")
+    print(f"Agents: {num_agents}")
+    
+    # Load map
+    grid_map = load_map_file(map_path)
+    graph = Graph(grid_map)
+    
+    print(f"Grid size: {grid_map.shape[0]}x{grid_map.shape[1]}")
+    
+    # Load scenario
+    map_name, starts, goals = load_scenario_file(scen_path, num_agents)
+    
+    print(f"Loaded {len(starts)} agents")
+    print(f"First agent: start={starts[0]}, goal={goals[0]}")
+    
+    results = {}
+    
+    # Test PIBT
+    if algorithm in ['pibt', 'both']:
+        print("\n" + "="*50)
+        print("Running PIBT...")
+        start_time = time.time()
+        pibt = PIBT(graph, starts, goals)
+        pibt_solution = pibt.solve(max_timesteps=500)
+        pibt_time = time.time() - start_time
+        
+        if pibt_solution:
+            soc, makespan = calculate_costs(pibt_solution, goals)
+            print(f"✓ PIBT SUCCESS!")
+            print(f"  Time: {pibt_time:.4f}s")
+            print(f"  Timesteps: {len(pibt_solution[0])}")
+            print(f"  Sum-of-costs: {soc}")
+            print(f"  Makespan: {makespan}")
+            results['pibt'] = (pibt_solution, pibt_time, soc, makespan)
+
+            if save_solution:
+                save_solution_to_file(pibt_solution, 'data/logs/pibt_solution.txt',
+                                    map_path=map_path, goals=goals)
+        else:
+            print("✗ PIBT FAILED")
+            results['pibt'] = None
+    
+    # Test LaCAM
+    if algorithm in ['lacam', 'both']:
+        print("\n" + "="*50)
+        print("Running LaCAM...")
+        start_time = time.time()
+        lacam = LaCAM(graph, starts, goals)
+        lacam_solution = lacam.solve(node_limit=100000, time_limit=60.0)
+        lacam_time = time.time() - start_time
+        
+        if lacam_solution:
+            soc, makespan = calculate_costs(lacam_solution, goals)
+            print(f"✓ LaCAM SUCCESS!")
+            print(f"  Time: {lacam_time:.4f}s")
+            print(f"  Timesteps: {len(lacam_solution[0])}")
+            print(f"  Sum-of-costs: {soc}")
+            print(f"  Makespan: {makespan}")
+            results['lacam'] = (lacam_solution, lacam_time, soc, makespan)
+
+
+            if save_solution:
+                save_solution_to_file(lacam_solution, 'data/logs/lacam_solution.txt',
+                                    map_path=map_path, goals=goals)
+            
+            # Visualize if requested
+            if visualize and lacam_solution:
+                print("\nOpening visualization window...")
+                print("   (Close window to continue)")
+                animate_solution_simple(grid_map, lacam_solution, starts, goals)
+        else:
+            print("✗ LaCAM FAILED")
+            results['lacam'] = None
+    
+    return results
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='LaCAM with PIBT - MAPF lesgo',
+        description='LaCAM with PIBT - MAPF (OPTIMIZED WITH LAZY BACKWARD BFS)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run all tests (no visualization)
-  python lacam_pibt.py
+  # Run custom tests
+  python lacam_pibt_final.py --mode custom --viz --test 1
   
-  # Run and visualize test 1
-  python lacam_pibt.py --viz 1
+  # Run benchmark test
+  python lacam_pibt_final.py --mode benchmark --map data/mapf-map/maze-32-32-4.map --scen data/mapf-scen-random/maze-32-32-4-random-1.scen --agents 10 --viz
   
-  # Run and visualize test 2
-  python lacam_pibt.py --viz 2
-  
-  # Run and visualize test 3
-  python lacam_pibt.py --viz 3
-  
-  # Run and visualize all tests
-  python lacam_pibt.py --viz all
+  # Run benchmark with both algorithms
+  python lacam_pibt_final.py --mode benchmark --map data/mapf-map/empty-32-32.map --scen data/mapf-scen-random/empty-32-32-random-1.scen --agents 20 --algo both
         """
     )
     
-    parser.add_argument('--viz', '--visualize', 
+    parser.add_argument('--mode', 
                        type=str, 
-                       default=None,
+                       default='custom',
+                       choices=['custom', 'benchmark'],
+                       help='Test mode: custom or benchmark')
+    
+    parser.add_argument('--viz', '--visualize', 
+                       action='store_true',
+                       help='Visualize solution')
+    
+    parser.add_argument('--test',
+                       type=str,
+                       default='all',
                        choices=['1', '2', '3', 'all'],
-                       help='Visualize test: 1, 2, 3, or all')
+                       help='Which custom test to run (only for custom mode)')
+    
+    # Benchmark-specific arguments
+    parser.add_argument('--map',
+                       type=str,
+                       help='Path to .map file (benchmark mode)')
+    
+    parser.add_argument('--scen',
+                       type=str,
+                       help='Path to .scen file (benchmark mode)')
+    
+    parser.add_argument('--agents',
+                       type=int,
+                       default=10,
+                       help='Number of agents (benchmark mode)')
+    
+    parser.add_argument('--algo',
+                       type=str,
+                       default='lacam',
+                       choices=['pibt', 'lacam', 'both'],
+                       help='Algorithm to run (benchmark mode)')
     
     args = parser.parse_args()
     
     print("\n" + "="*70)
-    print("LaCAM with PIBT lesgo")
+    print("LaCAM with PIBT - FINAL OPTIMIZED VERSION")
+    print("Optimizations: Lazy Backward BFS + NumPy Arrays + Occupancy Maps")
     print("="*70)
     
-    viz_test1 = args.viz in ['1', 'all']
-    viz_test2 = args.viz in ['2', 'all']
-    viz_test3 = args.viz in ['3', 'all']
+    if args.mode == 'custom':
+        # Run custom tests
+        viz_test1 = args.test in ['1', 'all']
+        viz_test2 = args.test in ['2', 'all']
+        viz_test3 = args.test in ['3', 'all']
+        
+        if args.viz:
+            viz_test1 = viz_test2 = viz_test3 = True
+        
+        if args.test in ['1', 'all']:
+            test_simple_example(visualize=viz_test1)
+        if args.test in ['2', 'all']:
+            test_complex_example(visualize=viz_test2)
+        if args.test in ['3', 'all']:
+            test_dense_scenario(visualize=viz_test3)
     
-    test_simple_example(visualize=viz_test1)
-    test_complex_example(visualize=viz_test2)
-    test_dense_scenario(visualize=viz_test3)
+    elif args.mode == 'benchmark':
+        # Run benchmark test
+        if not args.map or not args.scen:
+            print("ERROR: --map and --scen are required for benchmark mode")
+            sys.exit(1)
+        
+        test_benchmark_scenario(
+            map_path=args.map,
+            scen_path=args.scen,
+            num_agents=args.agents,
+            visualize=args.viz,
+            algorithm=args.algo
+        )
     
+    print("\n" + "="*70)
     print("All tests complete!")
+    print("="*70)
