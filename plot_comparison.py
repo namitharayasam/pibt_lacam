@@ -6,13 +6,11 @@ import argparse
 import os
 
 def plot_success_rate(csv_path: str, output_plot: str = None):
-    # Read data
     data = pd.read_csv(csv_path)
     
     # Calculate success rate for each algorithm and agent count
     success_rates = data.groupby(['algorithm', 'num_agents'])['success'].mean().reset_index()
     
-    # Create plot
     FONT_SIZE = 10
     plt.rcParams.update({'font.size': FONT_SIZE})
     
@@ -31,7 +29,6 @@ def plot_success_rate(csv_path: str, output_plot: str = None):
     ax.legend(fontsize=FONT_SIZE, frameon=True)
     ax.grid(True, alpha=0.3)
     
-    # Save plot
     if output_plot is None:
         output_plot = csv_path.replace('.csv', '_success_rate.png')
     
@@ -87,7 +84,7 @@ def plot_solution_quality(csv_path: str, output_plot: str = None):
         print("No successful runs to plot solution quality")
         return
     
-    # Calculate average SOC
+    # Calculate avg SOC
     avg_soc = successful_data.groupby(['algorithm', 'num_agents'])['soc'].mean().reset_index()
     
     FONT_SIZE = 10
