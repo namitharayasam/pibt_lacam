@@ -1030,6 +1030,12 @@ def test_benchmark_scenario(map_path: str, scen_path: str, num_agents: int = 10,
             if save_solution:
                 save_solution_to_file(lacam_solution, 'data/logs/lacam_solution.txt',
                                     map_path=map_path, goals=goals)
+
+            if visualize and 'pibt' in results and results['pibt'] is not None:
+                pibt_solution = results['pibt'][0]
+                print("\nOpening PIBT visualization window...")
+                print("   (Close window to continue)")
+                animate_solution_simple(grid_map, pibt_solution, starts, goals)
             
             # Visualize if requested
             if visualize and lacam_solution:
