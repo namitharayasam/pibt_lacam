@@ -430,7 +430,6 @@ class PIBTConfigGenerator:
         # Extract constraints
         constraints_dict = constraint.get_constraints()
         
-        # OPTIMIZED: Initialize state with NumPy arrays
         self.current_locs = np.array(current_config, dtype=np.int32)
         self.next_locs = np.full((self.num_agents, 2), -1, dtype=np.int32)
         self.constrained_agents = set(constraints_dict.keys())
@@ -459,7 +458,6 @@ class PIBTConfigGenerator:
                 continue  # Already assigned by constraint
             
             if self.next_locs[agent_id, 0] == -1:  # Not assigned
-                # THIS IS THE KEY: Call full PIBT recursive procedure
                 success = self._pibt_recursive(agent_id, None)
                 if not success:
                     return None  # Failed to generate valid configuration
@@ -509,7 +507,7 @@ class PIBTConfigGenerator:
             self.next_locs[agent_id] = np.array(candidate, dtype=np.int32)
             self.occupied_next[candidate] = agent_id
             
-            # OPTIMIZED: Check if another agent occupies this location
+            # Check if another agent occupies this location
             conflicting_agent = self.occupied_current[candidate]
             
             if (conflicting_agent != -1 and 
@@ -517,7 +515,7 @@ class PIBTConfigGenerator:
                 self.next_locs[conflicting_agent, 0] == -1 and
                 conflicting_agent not in self.constrained_agents):  # Don't move constrained agents!
                 
-                # Priority inheritance - RECURSIVE CALL
+                # Priority inheritance - rec call
                 if not self._pibt_recursive(conflicting_agent, agent_id):
                     # Failed, unreserve and try next candidate
                     self.occupied_next[candidate] = -1
