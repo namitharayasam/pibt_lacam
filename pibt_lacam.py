@@ -305,7 +305,7 @@ class LaCAM:
                 # Generate constraints for all neighbors + stay (Lines 11-13)
                 neighbors = self.graph.neighbors(current_vertex) + [current_vertex]
                 
-                # Randomize order for diversity (mentioned in paper Section 3.3)
+                # Randomize order for diversity (section 3.3)
                 np.random.shuffle(neighbors)
                 
                 for next_vertex in neighbors:
