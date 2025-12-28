@@ -32,48 +32,20 @@ class Graph:
                 neighbors.append((nr, nc))
         
         return neighbors
-    
-    def get_distance(self, start: Vertex, goal: Vertex) -> int:
-        # Get distance using cached backward BFS from goal
-        if start == goal:
-            return 0
-        
-        # If we haven't computed distances for this goal yet, do it now
-        if goal not in self.goal_distances:
-            self._compute_all_distances_from_goal(goal)
-        
-        return self.goal_distances[goal].get(start, float('inf'))
-    
-    def _compute_all_distances_from_goal(self, goal: Vertex):
-        # Backward BFS from goal to ALL reachable vertices
-        distances = {goal: 0}
-        queue = deque([(goal, 0)])
-        
-        while queue:
-            current, dist = queue.popleft()
-            
-            for neighbor in self.neighbors(current):
-                if neighbor not in distances:
-                    distances[neighbor] = dist + 1
-                    queue.append((neighbor, dist + 1))
-        
-        # Cache ALL distances for this goal
-        self.goal_distances[goal] = distances
-
 
 class RealtimeHeuristicSearch:
     def __init__(self, graph: Graph, start: Vertex, goal: Vertex, verbose: bool = True):
         self.graph = graph
         self.start = start
         self.goal = goal
+        
         self.verbose = verbose
         
         # location -> {'actions_tried': set(), 'edges': list()}
         self.database: Dict[Vertex, Dict] = {}
         self.discovery_order = {}
         
-        self.current_loc = start
-        
+        self.current_loc = start    
         self.messy_solution = [start]
         self.timestep = 0
         
@@ -125,7 +97,6 @@ class RealtimeHeuristicSearch:
             next_loc = self._execute_action(action)
             
             if self.verbose:
-                # h = self.graph.get_distance(self.current_loc, self.goal)
                 available = self._get_available_actions()
                 tried = self.database[self.current_loc]['actions_tried']
                 print(f"t={t}: At {self.current_loc}, available={available}, tried={tried}, chose {action}")
@@ -158,7 +129,6 @@ class RealtimeHeuristicSearch:
         if not untried:
             return None  # backtrack
         
-        # Sort by manhattan
         untried.sort(key=lambda a: self._heuristic_after_action(a))
         
         return untried[0]
@@ -260,7 +230,6 @@ def animate_realtime_search(grid_map: np.ndarray, messy_solution: List[Vertex],
                                               facecolor='lightblue', alpha=0.3,
                                               edgecolor='blue', linewidth=1))
         
-        # Draw path so far
         if frame > 0:
             path = messy_solution[:frame+1]
             rows = [p[0] for p in path]
@@ -292,7 +261,6 @@ def animate_realtime_search(grid_map: np.ndarray, messy_solution: List[Vertex],
     anim.save(save_path, writer='pillow', fps=2)
     
     plt.close()
-
 
 def test_realtime_backtracking():
     grid_map = np.zeros((4, 3), dtype=int)
@@ -329,7 +297,6 @@ def test_realtime_backtracking():
             print(f"  Clean solution length: {len(clean)}")
             print(f"  Clean path: {' -> '.join(str(p) for p in clean)}")
         
-        # Database table
         print("\n" + "="*70)
         print("DATABASE TABLE:")
         print("="*70)
@@ -461,7 +428,7 @@ if __name__ == "__main__":
         solution = solver.solve(max_timesteps=1000)
         
         if solution:
-            print(f"\n✓ SUCCESS!")
+            print(f"\nSUCCESS!")
             print(f"  Messy: {len(solution)} steps")
             clean = solver.extract_clean_solution()
             if clean:
@@ -472,9 +439,9 @@ if __name__ == "__main__":
                 animate_realtime_search(grid_map, solver.messy_solution, 
                                        start, goal, solver.database,
                                        save_path='data/logs/realtime_search.gif')
-                print("✓ Saved to data/logs/realtime_search.gif")
+                print("Saved to data/logs/realtime_search.gif")
         else:
-            print("\n✗ FAILED")
+            print("\nFAILED")
     else:
         # default
         test_realtime_backtracking()
