@@ -339,7 +339,6 @@ def test_realtime_backtracking():
         for loc in sorted(solver.database.keys(), key=lambda x: solver.discovery_order[x]):
             info = solver.database[loc]
             
-            # Format actions
             if info['actions_tried']:
                 actions_str = ', '.join([f"{a[0][0]}{a[1]}" for a in info['actions_tried']])
             else:
@@ -406,7 +405,6 @@ def load_map_file(map_path: str) -> np.ndarray:
     with open(map_path, 'r') as f:
         lines = f.readlines()
     
-    # Parse header
     header = {}
     map_start_idx = 0
     for i, line in enumerate(lines):
@@ -424,7 +422,6 @@ def load_map_file(map_path: str) -> np.ndarray:
     height = header['height']
     width = header['width']
     
-    # Parse map
     grid_map = np.zeros((height, width), dtype=int)
     for i in range(height):
         line = lines[map_start_idx + i].strip()
