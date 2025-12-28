@@ -172,7 +172,7 @@ class PIBT:
                 # Priority inheritance - recursive call
                 if not self._pibt_recursive(conflicting_agent, agent_id):
                     # Failed, unreserve and try next candidate
-                    self.occupied_next[candidate] = -1
+                    # self.occupied_next[candidate] = -1
                     self.next_locs[agent_id] = np.array([-1, -1], dtype=np.int32)
                     continue
             
