@@ -100,14 +100,13 @@ class PIBT:
         solution = [[tuple(loc)] for loc in self.starts]
         
         for timestep in range(max_timesteps):
-            # Check if all agents reached goals
             if np.all(np.all(self.current_locs == self.goals, axis=1)):
                 return solution
             
             if not self.plan_one_timestep():
                 return None  # failed
             
-            # move agents
+            # apply moves to agents
             self.current_locs = self.next_locs.copy()
             for i in range(self.num_agents):
                 solution[i].append(tuple(self.current_locs[i]))
