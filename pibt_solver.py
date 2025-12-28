@@ -503,7 +503,7 @@ def animate_solution_with_groups(grid_map: np.ndarray, pibt: PIBT,
     if save_path:
         print(f"Saving animation to {save_path}...")
         anim.save(save_path, writer='pillow', fps=2)
-        print(f"✓ Animation saved!")
+        print(f"Animation saved!")
     
     plt.tight_layout()
     plt.show()
@@ -693,7 +693,7 @@ Examples:
         
         if solution:
             soc, makespan = calculate_costs(solution, goals)
-            print(f"\n✓ SUCCESS!")
+            print(f"\nSUCCESS!")
             print(f"  Timesteps: {len(solution[0])}")
             print(f"  Sum-of-costs: {soc}")
             print(f"  Makespan: {makespan}")
@@ -705,7 +705,7 @@ Examples:
                     save_path='data/logs/pibt_groups.gif'
                 )
         else:
-            print("\n✗ FAILED")
+            print("\nFAILED")
     else:
         # Default test
         test_pibt_groups(num_agents=4, visualize=args.groups)
