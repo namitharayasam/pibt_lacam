@@ -10,7 +10,11 @@ from matplotlib import colors
 import os
 import matplotlib.patches as patches
 import matplotlib.cm as cm
-
+import networkx as nx
+from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
+from networkx.drawing.nx_agraph import graphviz_layout
+import random 
 
 Vertex = Tuple[int, int]  # (row, col)
 
@@ -19,7 +23,6 @@ class Graph:
         self.grid_map = grid_map
         self.height, self.width = grid_map.shape
         
-        # Store backward distances from goals
         self.goal_distances = {}  # goal -> {position: distance}
     
     def neighbors(self, v: Vertex) -> List[Vertex]:
@@ -41,12 +44,13 @@ class RealtimeHeuristicSearch:
         
         self.verbose = verbose
         
-        # location -> {'actions_tried': set(), 'edges': list()}
+        # location -> {'actions_tried': set(), 'incoming_edges': list(), 'incoming_edges_left': list()}
         self.database: Dict[Vertex, Dict] = {}
         self.discovery_order = {}
         
         self.current_loc = start    
         self.messy_solution = [start]
+        self.move_types = [] # explore or backtrack
         self.timestep = 0
         
         self.viz_history = []
@@ -66,7 +70,8 @@ class RealtimeHeuristicSearch:
             'database_snapshot': {
                 loc: {
                     'actions_tried': info['actions_tried'].copy(),
-                    'edges': info['edges'].copy()
+                    'incoming_edges': info['incoming_edges'].copy(),
+                    'incoming_edges_left': info['incoming_edges_left'].copy()
                 }
                 for loc, info in self.database.items()
             }
@@ -79,8 +84,7 @@ class RealtimeHeuristicSearch:
             
             action = self._get_next_action()
             
-            # Handle backtracking
-            if action is None: # only way to get none is when ALL actins from current location have been tried
+            if action is None:
                 if self.verbose:
                     print(f"t={t}: Stuck at {self.current_loc}, backtracking...")
                 
@@ -92,6 +96,7 @@ class RealtimeHeuristicSearch:
                 
                 self.current_loc = previous_loc
                 self.messy_solution.append(self.current_loc)
+                self.move_types.append('backtrack') 
                 continue
             
             next_loc = self._execute_action(action)
@@ -101,12 +106,12 @@ class RealtimeHeuristicSearch:
                 tried = self.database[self.current_loc]['actions_tried']
                 print(f"t={t}: At {self.current_loc}, available={available}, tried={tried}, chose {action}")
 
-
             self._record_action(self.current_loc, action)
             self._record_edge(self.current_loc, next_loc)
             
             self.current_loc = next_loc
             self.messy_solution.append(self.current_loc)
+            self.move_types.append('explore') 
         
         if self.verbose:
             print(f"\nTimeout after {max_timesteps} timesteps")
@@ -116,9 +121,9 @@ class RealtimeHeuristicSearch:
         if self.current_loc not in self.database:
             self.database[self.current_loc] = {
                 'actions_tried': set(),
-                'edges': []
+                'incoming_edges': [],
+                'incoming_edges_left': []
             }
-
             self.discovery_order[self.current_loc] = self.timestep
         
         available_actions = self._get_available_actions()
@@ -127,19 +132,19 @@ class RealtimeHeuristicSearch:
         untried = [a for a in available_actions if a not in tried_actions]
         
         if not untried:
-            return None  # backtrack
+            return None 
         
         untried.sort(key=lambda a: self._heuristic_after_action(a))
+        best_h = self._heuristic_after_action(untried[0])
+        best_actions = [a for a in untried if self._heuristic_after_action(a) == best_h]
         
-        return untried[0]
+        return random.choice(best_actions)
     
     def _get_available_actions(self) -> List[Tuple[str, Vertex]]:
         actions = []
         
         for neighbor in self.graph.neighbors(self.current_loc):
             actions.append(('MOVE', neighbor))
-        
-        actions.append(('STAY', self.current_loc))
         
         return actions
     
@@ -158,35 +163,39 @@ class RealtimeHeuristicSearch:
         if to_loc not in self.database:
             self.database[to_loc] = {
                 'actions_tried': set(),
-                'edges': []
+                'incoming_edges': [],
+                'incoming_edges_left': []
             }
             self.discovery_order[to_loc] = self.timestep
         
         if from_loc != to_loc:
-            self.database[to_loc]['edges'].append((from_loc, to_loc))
+            edge = (from_loc, to_loc)
+            self.database[to_loc]['incoming_edges'].append(edge)
+            self.database[to_loc]['incoming_edges_left'].append(edge)
     
     def _backtrack(self) -> Optional[Vertex]:
-        if not self.database[self.current_loc]['edges']:
+        if not self.database[self.current_loc]['incoming_edges_left']:
             return None
         
-        from_loc, to_loc = self.database[self.current_loc]['edges'].pop()
+        from_loc, to_loc = self.database[self.current_loc]['incoming_edges_left'].pop()
         return from_loc
     
     def extract_clean_solution(self) -> Optional[List[Vertex]]:
         if not self.messy_solution:
             return None
         
-        clean = []
-        visited_positions = {}  # position -> index in clean path
+        clean = [self.messy_solution[0]]
         
-        for loc in self.messy_solution:
-            if loc in visited_positions:
-                # we've been here before - backtracked, so remove loop
-                backtrack_idx = visited_positions[loc]
-                clean = clean[:backtrack_idx + 1] 
+        for i in range(1, len(self.messy_solution)):
+            current = self.messy_solution[i]
+            
+            if current in clean:
+                idx = len(clean) - 1
+                while idx >= 0 and clean[idx] != current:
+                    idx -= 1
+                clean = clean[:idx + 1]
             else:
-                clean.append(loc)
-                visited_positions[loc] = len(clean) - 1
+                clean.append(current)
         
         return clean
 
@@ -243,10 +252,6 @@ def animate_realtime_search(grid_map: np.ndarray, messy_solution: List[Vertex],
                fontsize=14, color='white', fontweight='bold')
         
         status = f"Location: {messy_solution[frame]}"
-        if frame > 0:
-            prev = messy_solution[frame-1]
-            if prev == messy_solution[frame]:
-                status += " (STAY)"
         
         ax.text(0.02, 0.98, status,
                transform=ax.transAxes, verticalalignment='top',
@@ -261,6 +266,201 @@ def animate_realtime_search(grid_map: np.ndarray, messy_solution: List[Vertex],
     anim.save(save_path, writer='pillow', fps=2)
     
     plt.close()
+
+
+def visualize_search_graph(database: Dict, start: Vertex, goal: Vertex, 
+                          discovery_order: Dict, messy_solution: List[Vertex],
+                          move_types: List[str],
+                          save_path: str = 'search_graph.png'):
+
+    G = nx.DiGraph()
+    
+    for loc in database.keys():
+        G.add_node(loc)
+    
+    for loc, info in database.items():
+        for edge in info['incoming_edges']:
+            from_loc, to_loc = edge
+            G.add_edge(from_loc, to_loc)
+    
+    exploration_edges = set()
+    backtrack_edges = {}
+    
+    for i in range(len(move_types)):
+        from_loc = messy_solution[i]
+        to_loc = messy_solution[i + 1]
+        
+        if from_loc == to_loc:
+            continue
+        
+        edge = (from_loc, to_loc)
+        timestep = i + 1  
+        
+        if move_types[i] == 'backtrack':
+            if edge not in backtrack_edges:
+                backtrack_edges[edge] = []
+            backtrack_edges[edge].append(timestep)
+        else:
+            exploration_edges.add(edge)
+    
+    fig, ax = plt.subplots(figsize=(34, 28))
+    
+    try:
+        # pos = nx.planar_layout(G)
+        pos = graphviz_layout(G, prog='dot')
+    except:
+        try:
+            # pos = nx.kamada_kawai_layout(G)
+             pos = nx.kamada_kawai_layout(G)
+        except:
+            pos = nx.spring_layout(G, k=3, iterations=100, seed=42)
+    
+    node_colors = []
+    for node in G.nodes():
+        if node == start:
+            node_colors.append('#90EE90')  
+        elif node == goal:
+            node_colors.append('#FFB6C6') 
+        else:
+            node_colors.append('#ADD8E6')  
+    
+    nx.draw_networkx_nodes(G, pos, node_color=node_colors, 
+                          node_size=1500, alpha=0.95, ax=ax,
+                          edgecolors='black', linewidths=2.5)
+    
+    if exploration_edges:
+        nx.draw_networkx_edges(G, pos, 
+                              edgelist=list(exploration_edges),
+                              edge_color='black',
+                              arrows=True, 
+                              arrowsize=25,
+                              arrowstyle='->',
+                              width=2.5,
+                              connectionstyle='arc3,rad=0.1',
+                              node_size=1500,
+                              ax=ax,
+                              alpha=0.8)
+    
+    backtrack_edge_list = list(backtrack_edges.keys())
+    if backtrack_edge_list:
+        nx.draw_networkx_edges(G, pos, 
+                              edgelist=backtrack_edge_list,
+                              edge_color='red',
+                              arrows=True, 
+                              arrowsize=25,
+                              arrowstyle='->',
+                              width=3.5,
+                              style='dashed',
+                              connectionstyle='arc3,rad=0.25',
+                              node_size=1500,
+                              ax=ax,
+                              alpha=0.9)
+    
+    edge_labels = {}
+    for edge, timesteps in backtrack_edges.items():
+        if len(timesteps) == 1:
+            edge_labels[edge] = f"t={timesteps[0]}"
+        else:
+            times_str = ','.join([f"{t}" for t in timesteps])
+            edge_labels[edge] = f"t={times_str}"
+    
+    if edge_labels:
+        nx.draw_networkx_edge_labels(G, pos, edge_labels, 
+                                     font_size=8, 
+                                     font_color='darkred',
+                                     font_weight='bold',
+                                     bbox=dict(boxstyle='round,pad=0.4', 
+                                              facecolor='yellow', 
+                                              edgecolor='red', 
+                                              alpha=0.85,
+                                              linewidth=1.5),
+                                     ax=ax)
+    
+
+    labels = {}
+    for node in G.nodes():
+        t = discovery_order[node]
+        if node == start:
+            labels[node] = f"{node}\nt={t}\n[START]"
+        elif node == goal:
+            labels[node] = f"{node}\nt={t}\n[GOAL]"
+        else:
+            labels[node] = f"{node}\nt={t}"
+    
+    nx.draw_networkx_labels(G, pos, labels, font_size=8, 
+                           font_weight='bold', 
+                           font_family='monospace',
+                           ax=ax)
+    
+
+    title = "Real-Time Heuristic Search - Tree Structure\n"
+    title += f"Nodes Explored: {len(G.nodes())} | "
+    title += f"Exploration Edges: {len(exploration_edges)} | "
+    title += f"Backtrack Edges: {len(backtrack_edges)}"
+    
+    ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
+    ax.axis('off')
+    
+
+    legend_elements = [
+        patches.Patch(facecolor='#90EE90', edgecolor='black', linewidth=2, 
+                     label='Start Node'),
+        patches.Patch(facecolor='#FFB6C6', edgecolor='black', linewidth=2,
+                     label='Goal Node'),
+        patches.Patch(facecolor='#ADD8E6', edgecolor='black', linewidth=2,
+                     label='Explored Node'),
+        Line2D([0], [0], color='black', linewidth=2.5, 
+               label='Exploration Edge (forward)'),
+        Line2D([0], [0], color='red', linewidth=3.5, linestyle='--', 
+               label='Backtrack Edge (stuck!)'),
+    ]
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=12, 
+             framealpha=0.95, edgecolor='black')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    
+    print(f"\n  Search graph visualization saved to {save_path}")
+    print(f"  - Total nodes: {len(G.nodes())}")
+    print(f"  - Exploration edges (black solid): {len(exploration_edges)}")
+    print(f"  - Backtrack edges (red dashed): {len(backtrack_edges)}")
+    
+    if backtrack_edges:
+        print(f"\n  Backtracking events:")
+        for edge, timesteps in sorted(backtrack_edges.items(), 
+                                     key=lambda x: x[1][0]):
+            from_loc, to_loc = edge
+            times = ', '.join([f"t={t}" for t in timesteps])
+            print(f"    {from_loc} -> {to_loc} at {times}")
+    else:
+        print(f"\n  No backtracking occurred!")
+
+
+def print_search_stats(database: Dict, start: Vertex, goal: Vertex, discovery_order: Dict):
+    print("\n" + "-"*70)
+    print("SEARCH GRAPH STATISTICS:")
+    print("-"*70)
+    
+    total_edges = sum(len(info['incoming_edges']) for info in database.values())
+    multi_parent_nodes = [(loc, info['incoming_edges']) 
+                          for loc, info in database.items() 
+                          if len(info['incoming_edges']) > 1]
+    
+    print(f"\nTotal nodes explored: {len(database)}")
+    print(f"Total edges: {total_edges}")
+    print(f"Nodes with multiple parents: {len(multi_parent_nodes)}")
+    
+    if multi_parent_nodes:
+        print("\nNodes with multiple parents:")
+        for loc, edges in multi_parent_nodes:
+            parents = [e[0] for e in edges]
+            print(f"  {loc}: {' & '.join(map(str, parents))}")
+    else:
+        print("\nNo loops detected")
+    
+    print("-"*70)
+
 
 def test_realtime_backtracking():
     grid_map = np.zeros((4, 3), dtype=int)
@@ -296,10 +496,13 @@ def test_realtime_backtracking():
         if clean:
             print(f"  Clean solution length: {len(clean)}")
             print(f"  Clean path: {' -> '.join(str(p) for p in clean)}")
-        
-        print("\n" + "="*70)
+    else:
+        print("\nFAILED - No solution found")
+    
+    if solver.messy_solution and len(solver.messy_solution) > 1:
+        print("\n" + "-"*70)
         print("DATABASE TABLE:")
-        print("="*70)
+        print("-"*70)
         print(f"{'Location':<12} {'Actions Tried':<30} {'Parent':<12} {'All Edges':<25}")
         print("-" * 79)
 
@@ -311,25 +514,23 @@ def test_realtime_backtracking():
             else:
                 actions_str = "none"
             
-            # Get parent
-            if info['edges']:
-                parent = str(info['edges'][-1][0])  # Last edge's from_loc
+            if info['incoming_edges']:
+                parent = str(info['incoming_edges'][-1][0])
             else:
                 parent = "⊥"
             
-            # All edges
-            if info['edges']:
-                edges_str = ', '.join([f"{e[0]}→{e[1]}" for e in info['edges']])
+            if info['incoming_edges']:
+                edges_str = ', '.join([f"{e[0]}→{e[1]}" for e in info['incoming_edges']])
             else:
                 edges_str = "none"
             
             print(f"{str(loc):<12} {actions_str:<30} {parent:<12} {edges_str:<25}")
 
-        print("\n" + "="*70)
+        print("\n" + "-"*70)
         print("TIMESTEP-BY-TIMESTEP TRACE:")
-        print("="*70)
-        print(f"{'Timestep':<10} {'Location':<12} {'Action':<20} {'Parent':<12} {'Edges':<25}")
-        print("-" * 79)
+        print("-"*70)
+        print(f"{'Timestep':<10} {'Location':<12} {'Action Chosen':<25} {'How Got Here':<25} {'Parent':<12} {'Edges':<30}")
+        print("-" * 122)
 
         for snapshot in solver.timestep_snapshots:
             t = snapshot['timestep']
@@ -337,36 +538,70 @@ def test_realtime_backtracking():
             db = snapshot['database_snapshot']
             
             if t == 0:
-                action = "START"
+                action_chosen = "START"
+            elif t < len(solver.messy_solution) - 1:
+                if t < len(solver.move_types) and solver.move_types[t] == 'backtrack':
+                    action_chosen = "BACKTRACK"
+                else:
+                    next_loc = solver.messy_solution[t + 1]
+                    if next_loc == loc:
+                        action_chosen = "STAY"
+                    else:
+                        action_chosen = f"MOVE to {next_loc}"
             else:
-                prev_loc = solver.messy_solution[t-1]
-                action = "STAY" if prev_loc == loc else f"MOVE to {loc}"
+                action_chosen = "GOAL REACHED" if solution else "STOPPED"
+            
+            if t == 0:
+                how_got_here = "START"
+            elif t - 1 < len(solver.move_types):
+                move_type = solver.move_types[t - 1]
+                prev_loc = solver.messy_solution[t - 1]
+                
+                if move_type == 'backtrack':
+                    how_got_here = f"← backtrack from {prev_loc}"
+                else:
+                    how_got_here = f"← from {prev_loc}"
+            else:
+                how_got_here = "?"
             
             if loc in db:
-                edges = db[loc]['edges']
+                edges = db[loc]['incoming_edges']
                 parent = str(edges[-1][0]) if edges else "⊥"
                 edges_str = ', '.join([f"{e[0]}→{e[1]}" for e in edges]) if edges else "none"
             else:
                 parent = "⊥"
                 edges_str = "none"
             
-            print(f"t={t:<8} {str(loc):<12} {action:<20} {parent:<12} {edges_str:<25}")
+            print(f"t={t:<8} {str(loc):<12} {action_chosen:<25} {how_got_here:<25} {parent:<12} {edges_str:<30}")
+        
+        
+        print_search_stats(
+            solver.database,
+            start,
+            goal,
+            solver.discovery_order
+        )
 
-        
+        visualize_search_graph(
+            solver.database,
+            start,
+            goal,
+            solver.discovery_order,
+            solver.messy_solution,
+            solver.move_types,
+            save_path='data/logs/search_graph.png'
+        )
+
         animate_realtime_search(
-                grid_map, 
-                solver.messy_solution, 
-                start, 
-                goal, 
-                solver.database,
-                save_path='data/logs/realtime_search.gif'
-            )
-        
-        return True
-                    
-    else:
-        print("\nFAILED")
-        return False
+            grid_map, 
+            solver.messy_solution, 
+            start, 
+            goal, 
+            solver.database,
+            save_path='data/logs/realtime_search.gif'
+        )
+    
+    return solution is not None
 
 def load_map_file(map_path: str) -> np.ndarray:
     with open(map_path, 'r') as f:
@@ -393,11 +628,86 @@ def load_map_file(map_path: str) -> np.ndarray:
     for i in range(height):
         line = lines[map_start_idx + i].strip()
         for j, char in enumerate(line):
-            if char in ['@', 'O', 'T', 'W']:  # Obstacles
+            if char in ['@', 'O', 'T', 'W']:
                 grid_map[i, j] = 1
-            # '.' and 'G' are passable (0)
     
     return grid_map
+
+
+def print_database_and_trace(solver, solution):
+    print("\n" + "-"*70)
+    print("DATABASE TABLE:")
+    print("-"*70)
+    print(f"{'Location':<12} {'Actions Tried':<30} {'Parent':<12} {'All Edges':<25}")
+    print("-" * 79)
+
+    for loc in sorted(solver.database.keys(), key=lambda x: solver.discovery_order[x]):
+        info = solver.database[loc]
+        
+        if info['actions_tried']:
+            actions_str = ', '.join([f"{a[0][0]}{a[1]}" for a in info['actions_tried']])
+        else:
+            actions_str = "none"
+        
+        if info['incoming_edges']:
+            parent = str(info['incoming_edges'][-1][0])
+        else:
+            parent = "⊥"
+        
+        if info['incoming_edges']:
+            edges_str = ', '.join([f"{e[0]}→{e[1]}" for e in info['incoming_edges']])
+        else:
+            edges_str = "none"
+        
+        print(f"{str(loc):<12} {actions_str:<30} {parent:<12} {edges_str:<25}")
+
+    print("\n" + "-"*70)
+    print("TIMESTEP-BY-TIMESTEP TRACE:")
+    print("-"*70)
+    print(f"{'Timestep':<10} {'Location':<12} {'Action Chosen':<25} {'How Got Here':<25} {'Parent':<12} {'Edges':<30}")
+    print("-" * 122)
+
+    for snapshot in solver.timestep_snapshots:
+        t = snapshot['timestep']
+        loc = snapshot['location']
+        db = snapshot['database_snapshot']
+        
+        if t == 0:
+            action_chosen = "START"
+        elif t < len(solver.messy_solution) - 1:
+            if t < len(solver.move_types) and solver.move_types[t] == 'backtrack':
+                action_chosen = "BACKTRACK"
+            else:
+                next_loc = solver.messy_solution[t + 1]
+                if next_loc == loc:
+                    action_chosen = "STAY"
+                else:
+                    action_chosen = f"MOVE to {next_loc}"
+        else:
+            action_chosen = "GOAL REACHED" if solution else "STOPPED"
+        
+        if t == 0:
+            how_got_here = "START"
+        elif t - 1 < len(solver.move_types):
+            move_type = solver.move_types[t - 1]
+            prev_loc = solver.messy_solution[t - 1]
+            
+            if move_type == 'backtrack':
+                how_got_here = f"← backtrack from {prev_loc}"
+            else:
+                how_got_here = f"← from {prev_loc}"
+        else:
+            how_got_here = "?"
+        
+        if loc in db:
+            edges = db[loc]['incoming_edges']
+            parent = str(edges[-1][0]) if edges else "⊥"
+            edges_str = ', '.join([f"{e[0]}→{e[1]}" for e in edges]) if edges else "none"
+        else:
+            parent = "⊥"
+            edges_str = "none"
+        
+        print(f"t={t:<8} {str(loc):<12} {action_chosen:<25} {how_got_here:<25} {parent:<12} {edges_str:<30}")
 
 
 if __name__ == "__main__":
@@ -408,15 +718,15 @@ if __name__ == "__main__":
     parser.add_argument('--map', help='Path to map file')
     parser.add_argument('--start', help='Start position (row,col)')
     parser.add_argument('--goal', help='Goal position (row,col)')
-    parser.add_argument('--gif', action='store_true', help='Save GIF')
+    parser.add_argument('--gif', action='store_true', help='Save GIF and visualizations')
     
     args = parser.parse_args()
     
     os.makedirs('data/logs', exist_ok=True)
     
-    print("\n" + "="*70)
+    print("\n" + "-"*70)
     print("REAL-TIME HEURISTIC SEARCH - Single Agent Pathfinding")
-    print("="*70)
+    print("-"*70)
     
     if args.map and args.start and args.goal:
         grid_map = load_map_file(args.map)
@@ -425,27 +735,51 @@ if __name__ == "__main__":
         
         graph = Graph(grid_map)
         solver = RealtimeHeuristicSearch(graph, start, goal, verbose=True)
-        solution = solver.solve(max_timesteps=1000)
+        solution = solver.solve(max_timesteps=10000)
         
         if solution:
             print(f"\nSUCCESS!")
             print(f"  Messy: {len(solution)} steps")
+            print(f"  Messy path: {' -> '.join(str(p) for p in solution)}")
+
             clean = solver.extract_clean_solution()
+            
             if clean:
                 print(f"  Clean: {len(clean)} steps")
-            
-            if args.gif:
-                print("\nSaving GIF...")
-                animate_realtime_search(grid_map, solver.messy_solution, 
-                                       start, goal, solver.database,
-                                       save_path='data/logs/realtime_search.gif')
-                print("Saved to data/logs/realtime_search.gif")
+                print(f"  Clean path: {' -> '.join(str(p) for p in clean)}")
         else:
             print("\nFAILED")
+        
+        if solver.messy_solution and len(solver.messy_solution) > 1 and args.gif:
+            print_database_and_trace(solver, solution)
+            
+            print_search_stats(
+                solver.database,
+                start,
+                goal,
+                solver.discovery_order
+            )
+
+            print("\nGenerating visualizations...")
+
+            visualize_search_graph(
+                solver.database,
+                start,
+                goal,
+                solver.discovery_order,
+                solver.messy_solution,
+                solver.move_types, 
+                save_path='data/logs/search_graph.png'
+            )
+
+            animate_realtime_search(grid_map, solver.messy_solution, 
+                                   start, goal, solver.database,
+                                   save_path='data/logs/realtime_search.gif')
+            print("Saved to data/logs/realtime_search.gif")
+
     else:
-        # default
         test_realtime_backtracking()
     
-    print("\n" + "="*70)
+    print("\n" + "-"*70)
     print("Complete!")
-    print("="*70)
+    print("-"*70)
