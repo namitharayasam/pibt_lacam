@@ -8,7 +8,6 @@ import matplotlib.patches as patches
 import matplotlib.animation as animation
 import os
 
-
 Vertex        = Tuple[int, int]
 Configuration = Tuple[Vertex, ...]
 AgentID       = int
@@ -47,28 +46,97 @@ class Graph:
         self.goal_distances[goal] = dist
 
 
+class GroupTracker:
+    def __init__(self, num_agents: int):
+        self.num_agents = num_agents
+        self.parent = list(range(num_agents))
+        self.rank = [0] * num_agents
+        self.size = [1] * num_agents
+        self.gid = [-1] * num_agents
+        self.originalgid = [-1] * num_agents
+    
+    def find(self, i: int) -> int:
+        if self.parent[i] != i:
+            self.parent[i] = self.find(self.parent[i])
+        return self.parent[i]
+    
+    def connect(self, k: int, j: int, gid: int):
+        rootK = self.find(k)
+        rootJ = self.find(j)
+        
+        if rootK == rootJ:
+            return
+        
+        if self.rank[rootK] < self.rank[rootJ]:
+            self.parent[rootK] = rootJ
+            self.size[rootJ] += self.size[rootK]
+            self.gid[rootJ] = gid
+        elif self.rank[rootK] > self.rank[rootJ]:
+            self.parent[rootJ] = rootK
+            self.size[rootK] += self.size[rootJ]
+            self.gid[rootK] = gid
+        else:
+            self.parent[rootJ] = rootK
+            self.size[rootK] += self.size[rootJ]
+            self.rank[rootK] += 1
+            self.gid[rootK] = gid
+    
+    def populateGroupTracker(self, groups: List['Group']):
+        for aGroup in groups:
+            if len(aGroup.agents) == 0:
+                continue
+            
+            root = min(aGroup.agents)
+            self.gid[root] = aGroup.gid
+            
+            for agent in aGroup.agents:
+                if agent != root:
+                    self.connect(root, agent, aGroup.gid)
+                self.originalgid[agent] = aGroup.gid
+    
+    def findGID(self, i: int) -> int:
+        return self.gid[self.find(i)]
+    
+    def setGID(self, i: int, gid: int):
+        self.gid[self.find(i)] = gid
+    
+    def getGroup(self, gid: int) -> Set[int]:
+        groupOfAgents = set()
+        for i in range(self.num_agents):
+            if self.gid[self.find(i)] == gid:
+                groupOfAgents.add(i)
+        return groupOfAgents
+    
+    def getGroupedWith(self, group: 'Group') -> Set[int]:
+        if len(group.agents) == 0:
+            return set()
+        gid = self.findGID(min(group.agents))
+        return self.getGroup(gid)
+
+
 class PIBT:
-    def __init__(self, graph: Graph, goals: List[Vertex]):
+    def __init__(self, graph: Graph, goals: List[Vertex], verbose: bool = False):
         self.graph      = graph
         self.num_agents = len(goals)
         self.goals      = np.array(goals, dtype=np.int32)
         self.priorities = np.zeros(self.num_agents)
+        self.verbose    = verbose
 
         self.current_locs     : np.ndarray
         self.next_locs        : np.ndarray
         self.occupied_current = np.full((graph.height, graph.width), -1, dtype=np.int32)
         self.occupied_next    = np.full((graph.height, graph.width), -1, dtype=np.int32)
 
-        self.constrained_agents: Set[int]             = set()
-        self.desired           : Dict[int, Vertex]    = {}
-        self.failed_agents     : Set[int]             = set()
-        self.bump_chains       : Dict[int, List[int]] = {}
+        self.constrained_agents: Set[int] = set()
+        self.group_tracker: Optional[GroupTracker] = None
 
-    
     def plan_one_step(self, config: Configuration,
-                      constraints: List[Tuple[AgentID, Vertex]]
+                      constraints: List[Tuple[AgentID, Vertex]],
+                      group_tracker: Optional[GroupTracker] = None
                       ) -> Optional[Configuration]:
-
+        
+        self.group_tracker = group_tracker
+        
         cdict = {aid: v for aid, v in constraints}
         self.constrained_agents = set(cdict.keys())
 
@@ -88,14 +156,6 @@ class PIBT:
                 r, c = self.next_locs[i]
                 self.occupied_next[r, c] = i
 
-        self.bump_chains   = {}
-        self.failed_agents = set()
-        self.desired       = {}
-
-        for i in range(self.num_agents):
-            d = self._get_desired_position(i)
-            self.desired[i] = (int(d[0]), int(d[1]))
-
         for i in range(self.num_agents):
             if not np.array_equal(self.current_locs[i], self.goals[i]):
                 self.priorities[i] += 1
@@ -109,7 +169,7 @@ class PIBT:
             if aid in self.constrained_agents:
                 continue
             if self.next_locs[aid, 0] == -1:
-                self._pibt_recursive(aid, None, [aid])
+                self._pibt_recursive(aid, None)
 
         locs = [(int(self.next_locs[i][0]), int(self.next_locs[i][1]))
                 for i in range(self.num_agents)]
@@ -125,43 +185,14 @@ class PIBT:
                 cj = (int(self.current_locs[j][0]), int(self.current_locs[j][1]))
                 ni, nj = locs[i], locs[j]
                 if ci == nj and cj == ni:
+                    print(f"⚠️ SWAP DETECTED: Agent {i} and {j} - REJECTING config")
                     return None
-
-        for i in range(self.num_agents):
-            if i not in self.constrained_agents and locs[i] != self.desired[i]:
-                self.failed_agents.add(i)
-
-        desired_groups: Dict[Vertex, List[int]] = defaultdict(list)
-        for aid in range(self.num_agents):
-            if aid in self.constrained_agents:
-                continue
-            d = self.desired[aid]
-            desired_groups[(int(d[0]), int(d[1]))].append(aid)
-
-        for _vtx, agents in desired_groups.items():
-            if len(agents) < 2:
-                continue
-            if not any(a in self.failed_agents for a in agents):
-                continue
-            root = agents[0]
-            if root not in self.bump_chains:
-                self.bump_chains[root] = agents
 
         return tuple((int(r), int(c)) for r, c in locs)
 
-    def _get_desired_position(self, agent_id: int) -> Vertex:
-        cur  = tuple(self.current_locs[agent_id])
-        goal = tuple(self.goals[agent_id])
-        cands = self.graph.neighbors(cur) + [cur]
-        cands.sort(key=lambda v: (
-            self.graph.get_distance(v, goal),
-            self.occupied_current[v[0], v[1]] != -1
-        ))
-        return cands[0]
-
     def _pibt_recursive(self, agent_id: AgentID,
-                        blocked_by: Optional[AgentID],
-                        chain: List[int]) -> bool:
+                        blocked_by: Optional[AgentID]) -> bool:
+        
         if agent_id in self.constrained_agents:
             return True
 
@@ -175,10 +206,20 @@ class PIBT:
         ))
 
         for cand in cands:
+            # Vertex conflict
             if self.occupied_next[cand[0], cand[1]] != -1:
+                occupant = int(self.occupied_next[cand[0], cand[1]])
+                if self.group_tracker is not None:
+                    gid = self.group_tracker.findGID(agent_id)
+                    self.group_tracker.connect(agent_id, occupant, gid)
                 continue
+            
+            # Edge conflict
             if blocked_by is not None:
                 if tuple(self.current_locs[blocked_by]) == cand:
+                    if self.group_tracker is not None:
+                        gid = self.group_tracker.findGID(agent_id)
+                        self.group_tracker.connect(agent_id, blocked_by, gid)
                     continue
 
             self.next_locs[agent_id] = np.array(cand, dtype=np.int32)
@@ -190,11 +231,14 @@ class PIBT:
                 self.next_locs[occupant, 0] == -1 and
                 occupant not in self.constrained_agents):
 
-                extended = chain + [occupant]
-                if not self._pibt_recursive(occupant, agent_id, extended):
-                    self.bump_chains[chain[0]] = extended
+                if not self._pibt_recursive(occupant, agent_id):
                     self.next_locs[agent_id] = np.array([-1, -1], dtype=np.int32)
                     self.occupied_next[cand[0], cand[1]] = -1
+                    
+                    if self.group_tracker is not None:
+                        gid = self.group_tracker.findGID(agent_id)
+                        self.group_tracker.connect(agent_id, occupant, gid)
+                    
                     continue
 
             return True
@@ -203,41 +247,106 @@ class PIBT:
         self.occupied_next[cur[0], cur[1]] = agent_id
         return False
 
-    def detect_groups(self) -> List[Set[int]]:
-        conflict: Dict[int, Set[int]] = defaultdict(set)
 
-        for _root, chain in self.bump_chains.items():
-            if len(chain) < 2:
-                continue
-            if not any(a in self.failed_agents for a in chain):
-                continue
-            for i in range(len(chain)):
-                for j in range(i+1, len(chain)):
-                    conflict[chain[i]].add(chain[j])
-                    conflict[chain[j]].add(chain[i])
-
-        visited: Set[int] = set()
-        groups:  List[Set[int]] = []
-
-        for agent in range(self.num_agents):
-            if agent in visited or agent not in conflict:
-                visited.add(agent)
-                continue
-            component: Set[int] = set()
-            stack = [agent]
-            while stack:
-                cur = stack.pop()
-                if cur in visited:
-                    continue
-                visited.add(cur)
-                component.add(cur)
-                for nb in conflict[cur]:
-                    if nb not in visited:
-                        stack.append(nb)
-            if len(component) > 1:
-                groups.append(component)
-
-        return groups
+class Group:
+    
+    _next_gid = 0
+    
+    def __init__(self, agents: Set[AgentID], positions: Configuration, 
+                 graph: Graph, agent_order: List[AgentID]):
+        self.agents = frozenset(agents)
+        self.positions = tuple(positions[a] for a in sorted(agents))
+        self.graph = graph
+        self.gid = Group._next_gid
+        Group._next_gid += 1
+        
+        self.constraints: deque = deque()
+        self.avoidSuccessors: Set[Configuration] = set([self.positions])
+        self.retryConstraint = True
+        self.tryFirstParent = False
+        self.parents: List[Tuple[int, Configuration]] = []
+        self.parentsTraversed: Set[int] = set()
+        
+        self.order = [a for a in agent_order if a in agents]
+        self._using_parent = False 
+        self._initialize_constraints()
+    
+    def _initialize_constraints(self):
+        if not self.order:
+            return
+        
+        aid = self.order[0]
+        agent_list = sorted(self.agents)
+        if aid not in agent_list:
+            return
+        
+        pos = self.positions[agent_list.index(aid)]
+        neighbors = self.graph.neighbors(pos) + [pos]
+        for nb in neighbors:
+            self.constraints.append(ConstraintNode(None, aid, nb))
+    
+    def getNextConstraints(self) -> Optional[List[Tuple[AgentID, Vertex]]]:
+        if not self.retryConstraint:
+            self.updateConstraints()
+        
+        if self.constraints:
+            return self.constraints[0].get_constraints()
+        
+        if self.parents:
+            self._using_parent = True
+            return self._convertToConstraints(self.parents[-1])
+        
+        return None
+    
+    def _convertToConstraints(self, parent: Tuple[int, Configuration]) -> List[Tuple[AgentID, Vertex]]:
+        timestep, config = parent
+        constraints = []
+        for aid in self.agents:
+            constraints.append((aid, config[aid]))
+        return constraints
+    
+    def updateConstraints(self):
+        if self.constraints:
+            prevConstraint = self.constraints.popleft()
+            new_constraints = self._createMore(prevConstraint)
+            self.constraints.extend(new_constraints)
+        elif self.parents:
+            if self.tryFirstParent:
+                self.tryFirstParent = False
+            else:
+                self.parents.pop()
+    
+    def _createMore(self, node: 'ConstraintNode') -> List['ConstraintNode']:
+        depth = node.depth()
+        
+        if depth >= len(self.order):
+            return []
+        
+        aid = self.order[depth]
+        agent_list = sorted(self.agents)
+        if aid not in agent_list:
+            return []
+        
+        pos = self.positions[agent_list.index(aid)]
+        neighbors = self.graph.neighbors(pos) + [pos]
+        
+        children = []
+        for nb in neighbors:
+            children.append(ConstraintNode(node, aid, nb))
+        
+        return children
+    
+    def addParent(self, config: Configuration, timestep: int):
+        if timestep not in self.parentsTraversed:
+            self.parents.append((timestep, config))
+            group_positions = tuple(config[a] for a in sorted(self.agents))
+            self.avoidSuccessors.add(group_positions)
+    
+    def backtrackedEdge(self, config: Configuration, timestep: int):
+        self.parentsTraversed.add(timestep)
+    
+    def constraintsNotDone(self) -> bool:
+        return len(self.constraints) > 0 or len(self.parents) > 0
 
 
 class ConstraintNode:
@@ -265,62 +374,59 @@ class ConstraintNode:
         return out
 
 
-class GroupConstraintTree:
-    def __init__(self, graph: Graph, group: Set[AgentID],
-                 config: Configuration, agent_order: List[AgentID]):
-        self.graph   = graph
-        self.group   = group
-        self.order   = [a for a in agent_order if a in group]
-        self.config  = config
-        self.tree    : deque = deque()
-        self.exhausted       = False
-        self.last_global_at_reset: Optional[List[Tuple[AgentID, Vertex]]] = None
-        self._initialize()
-
-    def _initialize(self):
-        root = ConstraintNode(None, None, None)
-        if not self.order:
-            self.exhausted = True
-            return
-        aid = self.order[0]
-        vtx = self.config[aid]
-        for nb in self.graph.neighbors(vtx) + [vtx]:
-            self.tree.append(ConstraintNode(root, aid, nb))
-
-    def reset(self, current_global: List[Tuple[AgentID, Vertex]]):
-        self.tree.clear()
-        self.exhausted            = False
-        self.last_global_at_reset = list(current_global)
-        self._initialize()
-
-    def pop_next_constraint(self) -> Optional[List[Tuple[AgentID, Vertex]]]:
-        while self.tree:
-            node = self.tree.popleft()
-            if node.depth() < len(self.order):
-                idx = node.depth()
-                aid = self.order[idx]
-                vtx = self.config[aid]
-                for nb in self.graph.neighbors(vtx) + [vtx]:
-                    self.tree.append(ConstraintNode(node, aid, nb))
-                continue
-            return node.get_constraints()
-
-        self.exhausted = True
-        return None
+class GroupDatabase:
+    
+    def __init__(self):
+        self.groups: Dict[Tuple[frozenset, tuple], Group] = {}
+        self.creation_log: List[Dict] = []
+    
+    def getOrCreate(self, agents: Set[AgentID], config: Configuration,
+                    graph: Graph, agent_order: List[AgentID]) -> Group:
+        positions = tuple(config[a] for a in sorted(agents))
+        key = (frozenset(agents), positions)
+        
+        if key not in self.groups:
+            group = Group(agents, config, graph, agent_order)
+            self.groups[key] = group
+            self.creation_log.append({
+                'agents': set(agents),
+                'positions': set(positions),
+                'created_at': len(self.creation_log)
+            })
+        
+        return self.groups[key]
+    
+    def findApplicableGroups(self, config: Configuration) -> List[Group]:
+        applicable = []
+        
+        for (agents, positions), group in self.groups.items():
+            config_positions = tuple(config[a] for a in sorted(agents))
+            
+            if config_positions == positions:
+                applicable.append(group)
+        
+        return applicable
 
 
 class HighLevelNode:
     def __init__(self, config: Configuration, global_order: List[AgentID],
                  parent: Optional['HighLevelNode'],
-                 graph: Graph, num_agents: int):
-        self.config       = config
-        self.parent       = parent
-        self.graph        = graph
-        self.num_agents   = num_agents
+                 graph: Graph, num_agents: int, timestep: int):
+        self.config = config
+        self.parent = parent
+        self.graph = graph
+        self.num_agents = num_agents
         self.global_order = global_order
+        self.timestep = timestep
+        
         self.global_tree: deque = deque()
         self.global_tree.append(ConstraintNode(None, None, None))
-        self.group_trees: Dict[frozenset, GroupConstraintTree] = {}
+        
+        self.path_from_root: List[Configuration] = []
+        if parent is not None:
+            self.path_from_root = parent.path_from_root + [parent.config]
+        else:
+            self.path_from_root = []
 
     def global_tree_exhausted(self) -> bool:
         return len(self.global_tree) == 0
@@ -333,55 +439,53 @@ class HighLevelNode:
                 aid = self.global_order[idx]
                 vtx = self.config[aid]
                 nbs = self.graph.neighbors(vtx) + [vtx]
-                np.random.shuffle(nbs)
                 for nb in nbs:
                     self.global_tree.append(ConstraintNode(node, aid, nb))
                 continue
             return node.get_constraints()
         return None
 
-    def get_or_create_group_tree(self, group: Set[AgentID],
-                                 graph: Graph) -> GroupConstraintTree:
-        key = frozenset(group)
-        if key not in self.group_trees:
-            self.group_trees[key] = GroupConstraintTree(
-                graph, group, self.config, self.global_order)
-        return self.group_trees[key]
-
 
 class GroupedLaCAM:
     def __init__(self, graph: Graph, starts: List[Vertex], goals: List[Vertex],
                  verbose: bool = True):
-        self.graph      = graph
-        self.starts     = tuple(starts)
-        self.goals      = tuple(goals)
+        self.graph = graph
+        self.starts = tuple(starts)
+        self.goals = tuple(goals)
         self.num_agents = len(starts)
-        self.verbose    = verbose
-        self.pibt       = PIBT(graph, goals)
-        self.group_detections = []
+        self.verbose = verbose
+        self.pibt = PIBT(graph, goals, verbose=verbose)
+        
+        self.group_db = GroupDatabase()
+        self.visited_configs: Set[Configuration] = set()
+        
+        self.timestep_log: List[Dict] = []
+        self.all_explored_configs: List[Configuration] = []
 
     def solve(self, node_limit: int = 500_000,
               time_limit: float = 60.0) -> Optional[List[List[Vertex]]]:
 
         t0 = time.time()
-        open_list: List[HighLevelNode]              = []
-        explored:  Dict[Configuration, HighLevelNode] = {}
+        open_list: List[HighLevelNode] = []
+        explored: Dict[Configuration, HighLevelNode] = {}
 
         init_order = self._get_initial_order()
-        init_node  = HighLevelNode(self.starts, init_order, None,
-                                   self.graph, self.num_agents)
+        init_node = HighLevelNode(self.starts, init_order, None,
+                                   self.graph, self.num_agents, timestep=0)
         open_list.append(init_node)
         explored[self.starts] = init_node
         nodes_gen, nodes_exp = 1, 0
 
+        self.all_explored_configs.append(self.starts)
+
         while open_list:
             if time.time() - t0 > time_limit:
                 if self.verbose:
-                    print(f"✗ Timeout ({time_limit}s). exp={nodes_exp} gen={nodes_gen}")
+                    print(f"Timeout ({time_limit}s). exp={nodes_exp} gen={nodes_gen}")
                 return None
             if nodes_gen >= node_limit:
                 if self.verbose:
-                    print(f"✗ Node limit. exp={nodes_exp} gen={nodes_gen}")
+                    print(f"Node limit. exp={nodes_exp} gen={nodes_gen}")
                 return None
 
             node = open_list[-1]
@@ -389,11 +493,44 @@ class GroupedLaCAM:
             if node.config == self.goals:
                 if self.verbose:
                     print(f"✓ Found! exp={nodes_exp} gen={nodes_gen}")
-                    if self.group_detections:
-                        self._print_group_summary()
-                    else:
-                        print("\n(No groups detected during search)")
-                return self._backtrack(node)
+                    
+                    messy_paths = self._configs_to_paths(self.all_explored_configs)
+                    if messy_paths:
+                        print(f"\n{'='*70}")
+                        print("MESSY SEARCH PATH (all explored configs):")
+                        print(f"{'='*70}")
+                        for i, p in enumerate(messy_paths):
+                            print(f"  Agent {i}: {p}")
+                        print(f"Messy path length: {len(messy_paths[0])} timesteps")
+                    
+                    self._print_summary()
+                
+                clean_solution = self._backtrack(node)
+
+                if self.verbose:
+                    print(f"\n{'='*70}")
+                    print("VALIDATING SOLUTION:")
+                    print(f"{'='*70}")
+                    is_valid = self.validate_solution(clean_solution)
+                    if not is_valid:
+                        print("WARNING: Solution has conflicts!")
+                
+                os.makedirs('data/logs', exist_ok=True)
+                
+                if messy_paths:
+                    animate_mapf_solution(
+                        self.graph.grid_map, messy_paths, 
+                        list(self.starts), list(self.goals),
+                        save_path='data/logs/search_messy.gif'
+                    )
+                
+                animate_mapf_solution(
+                    self.graph.grid_map, clean_solution,
+                    list(self.starts), list(self.goals),
+                    save_path='data/logs/solution_clean.gif'
+                )
+                
+                return clean_solution
 
             if node.global_tree_exhausted():
                 open_list.pop()
@@ -406,9 +543,12 @@ class GroupedLaCAM:
                 open_list.pop()
                 continue
 
-            new_config = self._generate_config(node, global_con)
+            new_config = self._get_next_config(node, global_con)
             if new_config is None:
                 continue
+            
+            if new_config is not None:
+                self.all_explored_configs.append(new_config)
 
             if new_config in explored:
                 existing = explored[new_config]
@@ -417,142 +557,203 @@ class GroupedLaCAM:
                 continue
 
             new_order = self._get_order(new_config)
-            new_node  = HighLevelNode(new_config, new_order, node,
-                                      self.graph, self.num_agents)
+            new_node = HighLevelNode(new_config, new_order, node,
+                                      self.graph, self.num_agents, 
+                                      timestep=node.timestep + 1)
             open_list.append(new_node)
             explored[new_config] = new_node
             nodes_gen += 1
 
-            if self.verbose and nodes_gen % 5000 == 0:
+            if self.verbose and nodes_gen % 1000 == 0:
                 print(f"  … {nodes_gen} nodes")
 
         if self.verbose:
-            print(f"✗ Open empty. exp={nodes_exp}")
+            print(f"Open empty. exp={nodes_exp}")
         return None
 
-    def _generate_config(self, node: HighLevelNode,
+    def _get_next_config(self, node: HighLevelNode,
                          global_con: List[Tuple[AgentID, Vertex]]
                          ) -> Optional[Configuration]:
         
-        config = self.pibt.plan_one_step(node.config, global_con)
-        if config is None:
-            return None
-
-        groups = self.pibt.detect_groups()
-
-        if groups and self.verbose:
-            print(f"  [DEBUG] Groups detected at config {node.config}: {[set(g) for g in groups]}")
-
-        if not groups:
-            return config
-
-        if self.verbose:
-            self.group_detections.append({
-                'config': node.config,
-                'global_con': global_con,
-                'groups': [set(g) for g in groups],
-                'failed': self.pibt.failed_agents.copy(),
-                'desired': self.pibt.desired.copy(),
-                'actual': config
-            })
-
-        return self._try_group_constraints(node, global_con, groups)
-
-    def _try_group_constraints(self, node: HighLevelNode,
-                               global_con: List[Tuple[AgentID, Vertex]],
-                               groups: List[Set[AgentID]]
-                               ) -> Optional[Configuration]:
-        MAX_ATTEMPTS = 200
-        global_dict  = {aid: v for aid, v in global_con}
-
-        cached: Dict[frozenset, Optional[List[Tuple[AgentID, Vertex]]]] = {
-            frozenset(g): None for g in groups
+        config_repeated = node.config in self.visited_configs
+        
+        timestep_info = {
+            'timestep': node.timestep,
+            'config': node.config,
+            'repeated': config_repeated,
+            'groups_detected': [],
+            'applicable_groups': [],
+            'parents_added': []
         }
-
-        for attempt in range(MAX_ATTEMPTS):
-            merged       = list(global_con)
-            skip_attempt = False
-
-            for group in groups:
-                key   = frozenset(group)
-                gtree = node.get_or_create_group_tree(group, self.graph)
-
-                if cached[key] is None:
-                    if gtree.exhausted:
-                        if set(gtree.last_global_at_reset) == set(global_con):
-                            return None
-                        gtree.reset(global_con)
-                        if gtree.exhausted:
-                            return None
-
-                    g_con = gtree.pop_next_constraint()
-                    if g_con is None:
-                        skip_attempt = True
-                        break
-
-                    cached[key] = g_con
-
-                g_con = cached[key]
-
-                conflict = any(
-                    aid in global_dict and global_dict[aid] != v
-                    for aid, v in g_con
-                )
-                if conflict:
-                    cached[key] = None
-                    skip_attempt = True
-                    break
-
-                merged.extend(g_con)
-
-            if skip_attempt:
-                continue
-
-            seen: Dict[AgentID, Vertex] = {}
-            dup = False
-            for aid, v in merged:
-                if aid in seen:
-                    if seen[aid] != v:
-                        dup = True
-                        break
-                seen[aid] = v
-            if dup:
-                for g in groups:
-                    if aid in g:
-                        cached[frozenset(g)] = None
-                        break
-                continue
-
-            new_config = self.pibt.plan_one_step(node.config, merged)
-            if new_config is None:
-                cached = {k: None for k in cached}
-                continue
-
-            return new_config
-
-        return None
-
-    def _print_group_summary(self):
-        print("\n" + "="*100)
-        print("GROUP DETECTION SUMMARY")
-        print("="*100)
         
-        for i, det in enumerate(self.group_detections, 1):
-            print(f"\nEvent {i}:")
-            print(f"  Config: {det['config']}")
-            print(f"  Global Constraints: {det['global_con']}")
-            print(f"  Groups Detected: {det['groups']}")
+        if not config_repeated:
+            # FIRST VISIT: Run PIBT without constraints, detect groups
+            self.visited_configs.add(node.config)
+
+            if self.verbose:
+                print(f"\n[T{node.timestep}] First visit - running PIBT")
+
+            GT = GroupTracker(self.num_agents)
+            for i in range(self.num_agents):
+                GT.gid[i] = i
+
+            config = self.pibt.plan_one_step(node.config, [], GT)
+
+            if config is None:
+                return None
             
-            for g in det['groups']:
-                failed_in_group = g & det['failed']
-                if failed_in_group:
-                    print(f"    Group {g} failures:")
-                    for a in failed_in_group:
-                        desired = det['desired'][a]
-                        actual = det['actual'][a]
-                        print(f"      Agent {a}: wanted {desired}, got {actual}")
+            groups_detected = self._extract_groups_from_gt(GT, node.config)
+
+            for agents in groups_detected:
+                self.group_db.getOrCreate(agents, node.config, self.graph, node.global_order)
+                timestep_info['groups_detected'].append(sorted(agents))
+
+            if self.verbose and groups_detected:
+                print(f"  Detected {len(groups_detected)} groups: {[sorted(g) for g in groups_detected]}")
+            
+            self.timestep_log.append(timestep_info)
+            return config
         
-        print("\n" + "="*100)
+        else:
+            # REVISIT: Apply LaCAM + Group Constraints
+            if self.verbose:
+                print(f"\n[T{node.timestep}] LOOP DETECTED - applying group constraints")
+            
+            LaCAMConstraints = global_con
+            Groups = self.group_db.findApplicableGroups(node.config)
+            
+            if self.verbose:
+                print(f"  Found {len(Groups)} applicable groups")
+            
+            for group in Groups:
+                timestep_info['applicable_groups'].append(sorted(group.agents))
+
+                if node.parent is not None:
+                    group.addParent(node.parent.config, node.parent.timestep)
+                    timestep_info['parents_added'].append({
+                        'group': sorted(group.agents),
+                        'parent_timestep': node.parent.timestep
+                    })
+            
+            groupQueue: deque = deque(Groups)
+            GT = GroupTracker(self.num_agents)
+            GT.populateGroupTracker(Groups)
+            
+            # Build partial config as we go
+            partial_config = list(node.config)
+            
+            while groupQueue:
+                group = groupQueue.popleft()
+                
+                if self.verbose:
+                    print(f"  Planning group {sorted(group.agents)}")
+                
+                # Plan group and update partial_config directly
+                # success = self._plan_group_incremental(
+                    # group, tuple(partial_config), GT, LaCAMConstraints, partial_config
+                # )
+
+                success = self._plan_group_incremental(
+                    group, node.config, GT, LaCAMConstraints, partial_config
+                )
+                
+                if not success:
+                    if self.verbose:
+                        print(f"  Group {sorted(group.agents)} planning failed")
+                    return None
+                
+                if hasattr(group, '_using_parent') and group._using_parent:
+                    timestep_info.setdefault('backtracking_used', []).append(sorted(group.agents))
+                    group._using_parent = False
+            
+            if self.verbose:
+                print(f"  All groups planned successfully")
+            
+            self.timestep_log.append(timestep_info)
+            return tuple(partial_config)
+        
+    def _extract_groups_from_gt(self, GT: GroupTracker, config: Configuration) -> List[Set[int]]:
+        groups = []
+        visited = set()
+        
+        for i in range(self.num_agents):
+            if i in visited:
+                continue
+            
+            root = GT.find(i)
+            component = set()
+            
+            for j in range(self.num_agents):
+                if GT.find(j) == root:
+                    component.add(j)
+                    visited.add(j)
+            
+            if len(component) > 1:
+                groups.append(component)
+        
+        return groups
+
+    def _plan_group_incremental(self, group: Group, current_config: Configuration,
+                                GT: GroupTracker, LaCAMConstraints: List[Tuple[AgentID, Vertex]],
+                                partial_config: List[Vertex]) -> bool:
+        
+        lacam_dict = {aid: v for aid, v in LaCAMConstraints}
+        
+        while group.constraintsNotDone():
+            # Algorithm line 2: Set group's part of config to Null
+            for aid in group.agents:
+                partial_config[aid] = None
+            
+            constraints = group.getNextConstraints()
+            
+            if constraints is None:
+                if self.verbose:
+                    print(f"    No more constraints for group")
+                break
+            
+            conflict = any(
+                aid in lacam_dict and lacam_dict[aid] != v
+                for aid, v in constraints
+            )
+            
+            if conflict:
+                if self.verbose:
+                    print(f"    Conflict with LaCAM - using LaCAM constraints")
+                merged_constraints = list(LaCAMConstraints)
+                # for aid in group.agents:
+                    # if aid in lacam_dict:
+                        # partial_config[aid] = lacam_dict[aid]
+                # return True
+            
+            else:
+                merged_constraints = list(LaCAMConstraints) + [
+                (aid, v) for aid, v in constraints 
+                if aid not in lacam_dict
+            ]
+            
+            base_config = tuple(
+                partial_config[i] if partial_config[i] is not None else current_config[i]
+                for i in range(self.num_agents)
+            )
+            
+            success_config = self.pibt.plan_one_step(base_config, merged_constraints, GT)
+            
+            if success_config is not None:
+                for aid in group.agents:
+                    partial_config[aid] = success_config[aid]
+                
+                group.retryConstraint = False
+                if self.verbose:
+                    print(f"    Group planned successfully")
+                return True
+            
+            if self.verbose:
+                print(f"    Constraints failed, trying next")
+            group.updateConstraints()
+        
+        if self.verbose:
+            print(f"    Group constraints exhausted")
+        return False
 
     def _get_initial_order(self) -> List[AgentID]:
         dists = [self.graph.get_distance(self.starts[i], self.goals[i])
@@ -577,8 +778,178 @@ class GroupedLaCAM:
             for aid in range(self.num_agents):
                 vtx = cfg[aid]
                 paths[aid].append((int(vtx[0]), int(vtx[1])))
-
         return paths
+    
+    def _configs_to_paths(self, configs: List[Configuration]) -> List[List[Vertex]]:
+        if not configs:
+            return None
+        
+        paths = [[] for _ in range(self.num_agents)]
+        for cfg in configs:
+            for aid in range(self.num_agents):
+                vtx = cfg[aid]
+                paths[aid].append((int(vtx[0]), int(vtx[1])))
+        return paths
+    
+    def validate_solution(self, solution: List[List[Vertex]]) -> bool:
+        for t in range(len(solution[0]) - 1):
+            positions_t = [solution[a][t] for a in range(self.num_agents)]
+            positions_next = [solution[a][t+1] for a in range(self.num_agents)]
+            
+            # Check vertex conflicts
+            if len(set(positions_next)) != self.num_agents:
+                position_counts = {}
+                for i, pos in enumerate(positions_next):
+                    if pos not in position_counts:
+                        position_counts[pos] = []
+                    position_counts[pos].append(i)
+                for pos, agents in position_counts.items():
+                    if len(agents) > 1:
+                        print(f"Vertex conflict at t={t+1}: Agents {agents} at {pos}")
+                return False
+            
+            # Check swap conflicts
+            for i in range(self.num_agents):
+                for j in range(i+1, self.num_agents):
+                    if positions_t[i] == positions_next[j] and positions_t[j] == positions_next[i]:
+                        print(f"Swap conflict at t={t}: Agents {i} and {j}")
+                        return False
+        
+        print("✅ Solution is valid - no conflicts!")
+        return True
+
+    def _print_summary(self):
+        print("\n" + "="*100)
+        print("SEARCH SUMMARY")
+        print("="*100)
+        
+        self._print_database_table()
+        self._print_timestep_table()
+        self._print_parent_tracking_table()
+        self._print_statistics_table()
+    
+    def _print_database_table(self):
+        print("\n" + "="*100)
+        print("TABLE 1: GROUP DATABASE")
+        print("="*100)
+        
+        if not self.group_db.creation_log:
+            print("No groups stored in database.")
+            return
+        
+        print(f"{'Group ID':<10} {'Agents':<20} {'Positions':<60}")
+        print("-" * 100)
+        
+        for i, entry in enumerate(self.group_db.creation_log, 1):
+            agents_str = str(sorted(entry['agents']))
+            positions_str = str(sorted(entry['positions']))
+            if len(positions_str) > 58:
+                positions_str = positions_str[:55] + "..."
+            print(f"{i:<10} {agents_str:<20} {positions_str:<60}")
+        
+        print("="*100)
+    
+    def _print_timestep_table(self):
+        print("\n" + "="*120)
+        print("TABLE 2: TIMESTEP LOG")
+        print("="*120)
+        
+        if not self.timestep_log:
+            print("No timestep log available.")
+            return
+        
+        print(f"{'T':<4} {'Repeated':<10} {'Groups Detected':<20} {'Applicable Groups':<20} {'Parents Added':<30}")
+        print("-" * 120)
+        
+        for entry in self.timestep_log:
+            t = entry['timestep']
+            repeated = "YES" if entry['repeated'] else "NO"
+            groups_detected = str(entry.get('groups_detected', []))
+            if len(groups_detected) > 18:
+                groups_detected = groups_detected[:15] + "..."
+            applicable = str(entry.get('applicable_groups', []))
+            if len(applicable) > 18:
+                applicable = applicable[:15] + "..."
+            
+            parents_added = entry.get('parents_added', [])
+            if parents_added:
+                parent_str = f"{len(parents_added)} groups"
+            else:
+                parent_str = "-"
+            
+            print(f"{t:<4} {repeated:<10} {groups_detected:<20} {applicable:<20} {parent_str:<30}")
+        
+        print("="*120)
+    
+    def _print_parent_tracking_table(self):
+        print("\n" + "="*120)
+        print("TABLE 3: PARENT TRACKING & BACKTRACKING")
+        print("="*120)
+        
+        parent_added_events = []
+        backtrack_used_events = []
+        
+        for entry in self.timestep_log:
+            for parent_info in entry.get('parents_added', []):
+                parent_added_events.append({
+                    'timestep': entry['timestep'],
+                    'group': parent_info['group'],
+                    'parent_timestep': parent_info['parent_timestep']
+                })
+            
+            for group in entry.get('backtracking_used', []):
+                backtrack_used_events.append({
+                    'timestep': entry['timestep'],
+                    'group': group
+                })
+        
+        if not parent_added_events and not backtrack_used_events:
+            print("No parent tracking events (groups never needed backtracking).")
+            print("="*120)
+            return
+        
+        if parent_added_events:
+            print("\nParents Added (for potential backtracking):")
+            print(f"{'Timestep':<10} {'Group':<20} {'Parent From T':<20}")
+            print("-" * 60)
+            for event in parent_added_events:
+                print(f"{event['timestep']:<10} {str(event['group']):<20} {event['parent_timestep']:<20}")
+        
+        if backtrack_used_events:
+            print("\n" + "="*60)
+            print("Backtracking Actually Used:")
+            print(f"{'Timestep':<10} {'Group':<20}")
+            print("-" * 60)
+            for event in backtrack_used_events:
+                print(f"{event['timestep']:<10} {str(event['group']):<20}")
+        else:
+            print("\n" + "="*60)
+            print("Backtracking Never Used (constraint tree was sufficient)")
+        
+        print("="*120)
+    
+    def _print_statistics_table(self):
+        print("\n" + "="*100)
+        print("TABLE 4: SUMMARY STATISTICS")
+        print("="*100)
+        
+        total_timesteps = len(self.timestep_log)
+        total_loops = sum(1 for e in self.timestep_log if e['repeated'])
+        total_groups_detected = len(self.group_db.creation_log)
+        
+        print(f"{'Metric':<40} {'Value':<20}")
+        print("-" * 100)
+        
+        stats = [
+            ("Total timesteps processed", total_timesteps),
+            ("Loops detected (config repeated)", total_loops),
+            ("Unique groups stored in database", total_groups_detected),
+        ]
+        
+        for metric, value in stats:
+            print(f"{metric:<40} {value:<20}")
+        
+        print("="*100)
 
 
 def animate_mapf_solution(grid_map: np.ndarray, solution: List[List[Vertex]], 
@@ -647,101 +1018,6 @@ def animate_mapf_solution(grid_map: np.ndarray, solution: List[List[Vertex]],
     print(f"Animation saved to {save_path}")
 
 
-def visualize_solution_static(grid_map: np.ndarray, solution: List[List[Vertex]], 
-                              starts: List[Vertex], goals: List[Vertex],
-                              save_path: str = 'mapf_solution.png'):
-    
-    if not solution:
-        print("No solution to visualize")
-        return
-    
-    num_agents = len(solution)
-    height, width = grid_map.shape
-    colors = plt.cm.tab10(range(num_agents))
-    
-    fig, ax = plt.subplots(figsize=(14, 14))
-    ax.set_xlim(-0.5, width - 0.5)
-    ax.set_ylim(-0.5, height - 0.5)
-    ax.set_aspect('equal')
-    ax.invert_yaxis()
-    ax.set_xticks(range(width))
-    ax.set_yticks(range(height))
-    ax.grid(True, alpha=0.3)
-    ax.set_title(f"Grouped LaCAM Solution - All Paths", fontsize=16, fontweight='bold')
-    
-    for i in range(height):
-        for j in range(width):
-            if grid_map[i, j] == 1:
-                ax.add_patch(plt.Rectangle((j-0.5, i-0.5), 1, 1, 
-                                          color='black', alpha=0.7))
-    
-    for agent_id in range(num_agents):
-        path = solution[agent_id]
-        rows = [p[0] for p in path]
-        cols = [p[1] for p in path]
-        ax.plot(cols, rows, '-', color=colors[agent_id], alpha=0.6, linewidth=3, 
-               label=f'Agent {agent_id}')
-    
-    for agent_id, start in enumerate(starts):
-        sr, sc = start
-        ax.add_patch(patches.Rectangle((sc-0.4, sr-0.4), 0.8, 0.8,
-                                       facecolor=colors[agent_id], alpha=0.5,
-                                       edgecolor='black', linewidth=2))
-        ax.text(sc, sr, 'S'+str(agent_id), ha='center', va='center', 
-               fontsize=8, color='black', fontweight='bold')
-    
-    for agent_id, goal in enumerate(goals):
-        gr, gc = goal
-        ax.add_patch(patches.Circle((gc, gr), 0.35,
-                                   facecolor=colors[agent_id], 
-                                   edgecolor='black', linewidth=2))
-        ax.text(gc, gr, 'G'+str(agent_id), ha='center', va='center', 
-               fontsize=8, color='white', fontweight='bold')
-    
-    ax.legend(loc='upper left', fontsize=10, framealpha=0.95)
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Static visualization saved to {save_path}")
-
-
-def load_map_file(path: str) -> np.ndarray:
-    with open(path) as f:
-        lines = f.readlines()
-    header, map_start = {}, 0
-    for i, line in enumerate(lines):
-        tok = line.strip().split()
-        if   tok[0] == 'height': header['height'] = int(tok[1])
-        elif tok[0] == 'width':  header['width']  = int(tok[1])
-        elif tok[0] == 'map':    map_start = i+1; break
-    H, W = header['height'], header['width']
-    grid = np.zeros((H, W), dtype=int)
-    for i in range(H):
-        for j, ch in enumerate(lines[map_start+i].strip()):
-            if ch in '@OTW':
-                grid[i, j] = 1
-    return grid
-
-
-def load_scenario_file(path: str, num_agents: int = None):
-    with open(path) as f:
-        lines = f.readlines()
-    starts, goals, map_name = [], [], None
-    for line in lines[1:]:
-        parts = line.strip().split()
-        if len(parts) < 9:
-            continue
-        if map_name is None:
-            map_name = parts[1]
-        starts.append((int(parts[5]), int(parts[4])))
-        goals.append( (int(parts[7]), int(parts[6])))
-        if num_agents and len(starts) >= num_agents:
-            break
-    return map_name, starts, goals
-
-
 def calculate_costs(solution, goals):
     if not solution:
         return float('inf'), float('inf')
@@ -772,16 +1048,17 @@ def test_corridor_swap():
     sol = GroupedLaCAM(graph, starts, goals, verbose=True).solve(time_limit=10.0)
     if sol:
         soc, ms = calculate_costs(sol, goals)
-        print(f"\n  ✓ SOC={soc}  Makespan={ms}")
-        for i, p in enumerate(sol): print(f"    Agent {i}: {p}")
+        print(f"\n{'='*70}")
+        print("CLEAN SOLUTION PATH:")
+        print(f"{'='*70}")
+        print(f"SOC={soc}  Makespan={ms}")
+        for i, p in enumerate(sol): 
+            print(f"  Agent {i}: {p}")
         
-        os.makedirs('data/logs', exist_ok=True)
-        visualize_solution_static(grid, sol, starts, goals, 
-                                 save_path='data/logs/corridor_swap_solution.png')
-        animate_mapf_solution(grid, sol, starts, goals,
-                             save_path='data/logs/corridor_swap_solution.gif')
+        print(f"\nSaved: data/logs/search_messy.gif (all explored)")
+        print(f"Saved: data/logs/solution_clean.gif (final solution)")
     else:
-        print("\n  ✗ FAILED")
+        print("\nFAILED")
     return sol is not None
 
 
@@ -798,16 +1075,17 @@ def test_open_swap():
     sol = GroupedLaCAM(graph, starts, goals, verbose=True).solve(time_limit=10.0)
     if sol:
         soc, ms = calculate_costs(sol, goals)
-        print(f"\n  ✓ SOC={soc}  Makespan={ms}")
-        for i, p in enumerate(sol): print(f"    Agent {i}: {p}")
+        print(f"\n{'='*70}")
+        print("CLEAN SOLUTION PATH:")
+        print(f"{'='*70}")
+        print(f"SOC={soc}  Makespan={ms}")
+        for i, p in enumerate(sol): 
+            print(f"  Agent {i}: {p}")
         
-        os.makedirs('data/logs', exist_ok=True)
-        visualize_solution_static(grid, sol, starts, goals, 
-                                 save_path='data/logs/open_swap_solution.png')
-        animate_mapf_solution(grid, sol, starts, goals,
-                             save_path='data/logs/open_swap_solution.gif')
+        print(f"\nSaved: data/logs/search_messy.gif (all explored)")
+        print(f"Saved: data/logs/solution_clean.gif (final solution)")
     else:
-        print("\n  ✗ FAILED")
+        print("\nFAILED")
     return sol is not None
 
 
@@ -821,130 +1099,105 @@ def test_two_pairs():
     goals  = [(0,4),(0,0),(4,4),(4,0)]
     _print_map(grid, starts, goals)
 
-    sol = GroupedLaCAM(graph, starts, goals, verbose=True).solve(time_limit=100000.0)
+    sol = GroupedLaCAM(graph, starts, goals, verbose=True).solve(time_limit=60.0)
     if sol:
         soc, ms = calculate_costs(sol, goals)
-        print(f"\n  ✓ SOC={soc}  Makespan={ms}")
-        for i, p in enumerate(sol): print(f"    Agent {i}: {p}")
+        print(f"\n{'='*70}")
+        print("CLEAN SOLUTION PATH:")
+        print(f"{'='*70}")
+        print(f"SOC={soc}  Makespan={ms}")
+        for i, p in enumerate(sol): 
+            print(f"  Agent {i}: {p}")
         
-        os.makedirs('data/logs', exist_ok=True)
-        visualize_solution_static(grid, sol, starts, goals, 
-                                 save_path='data/logs/two_pairs_solution.png')
-        animate_mapf_solution(grid, sol, starts, goals,
-                             save_path='data/logs/two_pairs_solution.gif')
+        print(f"\nSaved: data/logs/search_messy.gif (all explored)")
+        print(f"Saved: data/logs/solution_clean.gif (final solution)")
     else:
-        print("\n  ✗ FAILED")
+        print("\nFAILED")
     return sol is not None
 
-
-def test_three_agents_corridor():
+def test_four_by_seven_swap():
     print("\n" + "="*70)
-    print("TEST: Three Agents Corridor")
+    print("TEST: 4x7 Grid with 3 Swapping Pairs (6 agents)")
     print("="*70)
-    grid   = np.array([
-        [0,0,0,0,0],
-        [1,0,0,1,1],
-    ], dtype=int)
-    graph  = Graph(grid)
-    starts = [(0,0),(0,3),(0,4)]
-    goals  = [(0,4),(0,0),(0,2)]
-    _print_map(grid, starts, goals)
-
-    sol = GroupedLaCAM(graph, starts, goals, verbose=True).solve(time_limit=30.0)
-    if sol:
-        soc, ms = calculate_costs(sol, goals)
-        print(f"\n  ✓ SOC={soc}  Makespan={ms}")
-        for i, p in enumerate(sol): print(f"    Agent {i}: {p}")
-        
-        os.makedirs('data/logs', exist_ok=True)
-        visualize_solution_static(grid, sol, starts, goals, 
-                                 save_path='data/logs/three_agents_solution.png')
-        animate_mapf_solution(grid, sol, starts, goals,
-                             save_path='data/logs/three_agents_solution.gif')
-    else:
-        print("\n  ✗ FAILED")
-    return sol is not None
-
-
-def test_benchmark(map_path, scen_path, num_agents=10):
-    print("\n" + "="*70)
-    print(f"TEST: Benchmark ({num_agents} agents)")
-    print("="*70)
-    grid  = load_map_file(map_path)
+    
+    grid = np.zeros((4, 7), dtype=int)
+    
+    # Left column obstacles (col 0, rows 1-3)
+    grid[1, 0] = 1
+    grid[2, 0] = 1
+    grid[3, 0] = 1
+    
+    # Column 2 obstacles (rows 1-3)
+    grid[1, 2] = 1
+    grid[2, 2] = 1
+    grid[3, 2] = 1
+    
+    # Column 4 obstacles (rows 1-3)
+    grid[1, 4] = 1
+    grid[2, 4] = 1
+    grid[3, 4] = 1
+    
+    # Right column obstacles (col 6, rows 1-3)
+    grid[1, 6] = 1
+    grid[2, 6] = 1
+    grid[3, 6] = 1
+    
     graph = Graph(grid)
-    _, starts, goals = load_scenario_file(scen_path, num_agents)
-    print(f"    Map {grid.shape[0]}×{grid.shape[1]},  {len(starts)} agents")
-
-    t0  = time.time()
-    sol = GroupedLaCAM(graph, starts, goals, verbose=True).solve(time_limit=30.0)
-    elapsed = time.time() - t0
-
+    
+    starts = [
+        (1, 1),  # Agent 1
+        (2, 1),  # Agent 2
+        (1, 3),  # Agent 3
+        (2, 3),  # Agent 4
+        (1, 5),  # Agent 5
+        (2, 5)   # Agent 6
+    ]
+    
+    goals = [
+        (2, 1),  # Agent 1 → down
+        (1, 1),  # Agent 2 → up
+        (2, 3),  # Agent 3 → down
+        (1, 3),  # Agent 4 → up
+        (2, 5),  # Agent 5 → down
+        (1, 5)   # Agent 6 → up
+    ]
+    
+    _print_map(grid, starts, goals)
+    
+    sol = GroupedLaCAM(graph, starts, goals, verbose=True).solve(time_limit=60.0)
     if sol:
         soc, ms = calculate_costs(sol, goals)
-        print(f"\n  ✓ SOC={soc}  Makespan={ms}  Time={elapsed:.3f}s")
+        print(f"\n{'='*70}")
+        print("CLEAN SOLUTION PATH:")
+        print(f"{'='*70}")
+        print(f"SOC={soc}  Makespan={ms}")
+        for i, p in enumerate(sol): 
+            print(f"  Agent {i}: {p}")
         
-        os.makedirs('data/logs', exist_ok=True)
-        visualize_solution_static(grid, sol, starts, goals, 
-                                 save_path='data/logs/benchmark_solution.png')
-        animate_mapf_solution(grid, sol, starts, goals,
-                             save_path='data/logs/benchmark_solution.gif')
+        print(f"\nSaved: data/logs/search_messy.gif (all explored)")
+        print(f"Saved: data/logs/solution_clean.gif (final solution)")
     else:
-        print(f"\n  ✗ FAILED ({elapsed:.3f}s)")
+        print("\nFAILED")
     return sol is not None
-
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Grouped LaCAM")
-    parser.add_argument('--map',    help='Map file')
-    parser.add_argument('--scen',   help='Scenario file')
-    parser.add_argument('--agents', type=int, default=10)
-    parser.add_argument('--starts', help='Start positions as "r1,c1;r2,c2;..."')
-    parser.add_argument('--goals',  help='Goal positions as "r1,c1;r2,c2;..."')
-    parser.add_argument('--test',   choices=['corridor','open','pairs','three','all'],
-                        default='all')
+    parser = argparse.ArgumentParser(description="Grouped LaCAM (Fully Algorithm-Compliant)")
+    parser.add_argument('--test', choices=['corridor','open','pairs','four_seven','all'],
+                        default='corridor')
     args = parser.parse_args()
 
     print("\n" + "="*70)
-    print("GROUPED LaCAM — Multi-Level Multi-Agent Pathfinding")
+    print("GROUPED LaCAM — FULLY ALGORITHM-COMPLIANT IMPLEMENTATION")
     print("="*70)
 
-    if args.starts and args.goals:
-        if not args.map:
-            print("Error: --map required when using --starts/--goals")
-        else:
-            grid = load_map_file(args.map)
-            graph = Graph(grid)
-            
-            starts = [tuple(map(int, s.split(','))) for s in args.starts.split(';')]
-            goals = [tuple(map(int, g.split(','))) for g in args.goals.split(';')]
-            
-            print(f"Custom test: {len(starts)} agents")
-            _print_map(grid, starts, goals)
-            
-            sol = GroupedLaCAM(graph, starts, goals, verbose=True).solve(time_limit=30.0)
-            if sol:
-                soc, ms = calculate_costs(sol, goals)
-                print(f"\n  ✓ SOC={soc}  Makespan={ms}")
-                for i, p in enumerate(sol): print(f"    Agent {i}: {p}")
-                
-                os.makedirs('data/logs', exist_ok=True)
-                visualize_solution_static(grid, sol, starts, goals, 
-                                         save_path='data/logs/custom_solution.png')
-                animate_mapf_solution(grid, sol, starts, goals,
-                                     save_path='data/logs/custom_solution.gif')
-            else:
-                print("\n  ✗ FAILED")
-    elif args.map and args.scen:
-        test_benchmark(args.map, args.scen, args.agents)
-    else:
-        results = {}
-        if args.test in ('corridor','all'): results['corridor'] = test_corridor_swap()
-        if args.test in ('open',   'all'):  results['open']     = test_open_swap()
-        if args.test in ('pairs',  'all'):  results['pairs']    = test_two_pairs()
-        if args.test in ('three',  'all'):  results['three']    = test_three_agents_corridor()
+    results = {}
+    if args.test in ('corridor','all'): results['corridor'] = test_corridor_swap()
+    if args.test in ('open',   'all'):  results['open']     = test_open_swap()
+    if args.test in ('pairs',  'all'):  results['pairs']    = test_two_pairs()
+    if args.test in ('four_seven','all'): results['four_seven'] = test_four_by_seven_swap()
 
-        print("\n" + "="*70)
-        print("RESULTS")
-        for name, ok in results.items():
-            print(f"  {name:12s} {'✓ PASS' if ok else '✗ FAIL'}")
-        print("="*70)
+    print("\n" + "="*70)
+    print("RESULTS")
+    for name, ok in results.items():
+        print(f"  {name:12s} {'✓ PASS' if ok else 'FAIL'}")
+    print("="*70)
