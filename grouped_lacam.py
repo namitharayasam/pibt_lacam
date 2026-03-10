@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.animation as animation
 import os
+import csv
 
 Vertex        = Tuple[int, int]
 Configuration = Tuple[Vertex, ...]
@@ -416,8 +417,11 @@ class GroupedLaCAM:
         self.search_snapshots: List[List[Configuration]] = []
         self.timestep_log: List[Dict] = []
 
+        self.nodes_exp = 0
+        self.nodes_gen = 0
+
     def solve(self, node_limit: int = 500_000,
-              time_limit: float = 60.0) -> Optional[List[List[Vertex]]]:
+          time_limit: float = 60.0) -> Optional[List[List[Vertex]]]:
 
         t0 = time.time()
         open_list: List[HighLevelNode] = []
@@ -425,7 +429,7 @@ class GroupedLaCAM:
 
         init_order = self._get_initial_order()
         init_node = HighLevelNode(self.starts, init_order, None,
-                                  self.graph, self.num_agents, timestep=0)
+                                self.graph, self.num_agents, timestep=0)
         open_list.append(init_node)
         explored[self.starts] = init_node
         nodes_gen, nodes_exp = 1, 0
@@ -472,15 +476,12 @@ class GroupedLaCAM:
 
                 os.makedirs('data/logs', exist_ok=True)
 
+                self.nodes_exp = nodes_exp
+                self.nodes_gen = nodes_gen
+
                 return clean_solution
 
             if node.global_tree_exhausted():
-                open_list.pop()
-                continue
-
-
-            node.expansion_count += 1
-            if node.expansion_count > 2 * self.num_agents:
                 open_list.pop()
                 continue
 
@@ -492,32 +493,44 @@ class GroupedLaCAM:
                 open_list.pop()
                 continue
 
+            node.expansion_count += 1
+            if node.expansion_count > 2 * self.num_agents:
+                new_config = self.pibt.plan_one_step(node.config, global_con, None)
+                if new_config is None or new_config in explored:
+                    open_list.pop()
+                    continue
+                new_order = self._get_order(new_config)
+                new_node = HighLevelNode(new_config, new_order, node,
+                                        self.graph, self.num_agents,
+                                        timestep=node.timestep + 1)
+                open_list.append(new_node)
+                explored[new_config] = new_node
+                nodes_gen += 1
+                continue
+
             new_config = self._get_next_config(node, global_con)
 
             if new_config is None:
                 continue
 
+            else:
+                frozen = [i for i in range(self.num_agents) if new_config[i] == node.config[i] and node.config[i] != self.goals[i]]
+                if self.verbose and frozen:
+                    print(f"  [FREEZE DETECT] T={node.timestep} Frozen agents: {frozen}")
+                    print(f"    Their positions: {[node.config[i] for i in frozen]}")
+                    print(f"    Their goals:     {[self.goals[i] for i in frozen]}")
+
+            # FIX 2: cycle detected → fall back to pure LaCAM
             if new_config in explored:
                 cycle_hits += 1
-
-                applicable_groups = self.group_db.findApplicableGroups(node.config)
-                for group in applicable_groups:
-                    group.updateConstraints()
-                    group.retryConstraint = False
-
-                existing = explored[new_config]
-                existing_groups = self.group_db.findApplicableGroups(existing.config)
-                for group in existing_groups:
-                    group.updateConstraints()
-                    group.retryConstraint = False
-
-                open_list.append(existing)
-                continue
+                new_config = self.pibt.plan_one_step(node.config, global_con, None)
+                if new_config is None or new_config in explored:
+                    continue
 
             new_order = self._get_order(new_config)
             new_node = HighLevelNode(new_config, new_order, node,
-                                     self.graph, self.num_agents,
-                                     timestep=node.timestep + 1)
+                                    self.graph, self.num_agents,
+                                    timestep=node.timestep + 1)
             open_list.append(new_node)
             explored[new_config] = new_node
             nodes_gen += 1
@@ -529,6 +542,7 @@ class GroupedLaCAM:
             print(f"Open empty. exp={nodes_exp}")
         self._save_search_gif()
         return None
+
 
     def _get_next_config(self, node: HighLevelNode,
                          global_con: List[Tuple[AgentID, Vertex]]
@@ -583,6 +597,7 @@ class GroupedLaCAM:
         GT = GroupTracker(self.num_agents)
         GT.populateGroupTracker(active_groups)
         partial_config = list(node.config)
+        planned_next = {}
 
         # TRY CASE 1: G + L together
         all_groups_success = True
@@ -590,9 +605,7 @@ class GroupedLaCAM:
             group = groupQueue.popleft()
             if self.verbose:
                 print(f"    Planning group {sorted(group.agents)}")
-            result = self._plan_group_incremental(
-                group, node.config, GT, global_con, partial_config
-            )
+            result = self._plan_group_incremental( group, node.config, GT, global_con, partial_config, planned_next)
             if result is None:
                 continue
             elif not result:
@@ -654,6 +667,7 @@ class GroupedLaCAM:
         return None
 
     def _try_groups_only(self, config: Configuration, groups: List[Group]) -> Optional[Configuration]:
+        planned_next = {}
         groupQueue: deque = deque(groups)
         GT = GroupTracker(self.num_agents)
         GT.populateGroupTracker(groups)
@@ -661,9 +675,7 @@ class GroupedLaCAM:
 
         while groupQueue:
             group = groupQueue.popleft()
-            result = self._plan_group_incremental(
-                group, config, GT, [], partial_config
-            )
+            result = self._plan_group_incremental(group, config, GT, [], partial_config, planned_next)
             if result is None:
                 continue
             elif not result:
@@ -689,7 +701,7 @@ class GroupedLaCAM:
 
     def _plan_group_incremental(self, group: Group, current_config: Configuration,
                                 GT: GroupTracker, LaCAMConstraints: List[Tuple[AgentID, Vertex]],
-                                partial_config: List[Vertex]) -> Optional[bool]:
+                                partial_config: List[Vertex], planned_next) -> Optional[bool]:
 
         if not group.constraintsNotDone():
             return None
@@ -745,7 +757,7 @@ class GroupedLaCAM:
             already_planned = [
                 (i, partial_config[i])
                 for i in range(self.num_agents)
-                if partial_config[i] is not None and i not in group.agents
+                if i in planned_next and i not in group.agents and partial_config[i] is not None
             ]
 
             already_planned_dict = dict(already_planned)
@@ -766,6 +778,7 @@ class GroupedLaCAM:
             if success_config is not None:
                 for i in range(self.num_agents):
                     partial_config[i] = success_config[i]
+                    planned_next[i] = success_config[i]
                 group.retryConstraint = False
                 if self.verbose:
                     print(f"      Group planned successfully")
@@ -872,6 +885,22 @@ class GroupedLaCAM:
         )
 
 
+def save_to_csv(filepath, map_name, num_agents, time, soc, makespan, nodes_exp, nodes_gen, success):
+    file_exists = os.path.exists(filepath)
+    with open(filepath, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['map', 'agents', 'time', 'soc', 'makespan', 'nodes_exp', 'nodes_gen', 'success'])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            'map': map_name,
+            'agents': num_agents,
+            'time': round(time, 4),
+            'soc': soc,
+            'makespan': makespan,
+            'nodes_exp': nodes_exp,
+            'nodes_gen': nodes_gen,
+            'success': success
+        })
 
 # File I/O helpers
 
@@ -1036,17 +1065,19 @@ def animate_mapf_solution(grid_map: np.ndarray, solution: List[List[Vertex]],
             ax.add_patch(patches.Circle((gc, gr), 0.25,
                                         facecolor=colors[agent_id], alpha=0.2,
                                         edgecolor=colors[agent_id], linewidth=2, linestyle='--'))
+        
         for agent_id in range(num_agents):
             if frame > 0:
                 path = solution[agent_id][:frame+1]
                 rows = [p[0] for p in path]
                 cols = [p[1] for p in path]
                 ax.plot(cols, rows, '-', color=colors[agent_id], alpha=0.4, linewidth=2)
+        
         for agent_id in range(num_agents):
             r, c = solution[agent_id][frame]
-            ax.add_patch(patches.Circle((c, r), 0.35,
-                                        facecolor=colors[agent_id],
-                                        edgecolor='black', linewidth=2))
+            at_goal = (solution[agent_id][frame] == goals[agent_id])
+            color = '#90EE90' if at_goal else '#AEC6CF'
+            ax.add_patch(patches.Circle((c, r), 0.35, facecolor=color, edgecolor='black', linewidth=2))
             ax.text(c, r, str(agent_id), ha='center', va='center',
                     fontsize=10, color='white', fontweight='bold')
         return []
@@ -1055,6 +1086,7 @@ def animate_mapf_solution(grid_map: np.ndarray, solution: List[List[Vertex]],
                                    interval=500, repeat=True, blit=False)
     anim.save(save_path, writer='pillow', fps=2)
     plt.close()
+    
     print(f"Animation saved to {save_path}")
 
 
@@ -1098,6 +1130,10 @@ def test_benchmark_scenario(map_path: str, scen_path: str, num_agents: int = 10,
         print(f"  Timesteps:      {len(solution[0])}")
         print(f"  Sum-of-costs:   {soc}")
         print(f"  Makespan:       {makespan}")
+        print(f"  Nodes generated:{solver.nodes_gen}")
+        print(f"  Nodes expanded: {solver.nodes_exp}")
+
+        save_to_csv('results.csv', map_path, num_agents, elapsed, soc, makespan, solver.nodes_exp, solver.nodes_gen, True)
 
         if save_solution:
             save_solution_to_file(solution, 'data/logs/grouped_lacam_solution.txt',
@@ -1108,6 +1144,8 @@ def test_benchmark_scenario(map_path: str, scen_path: str, num_agents: int = 10,
                               save_path='data/logs/benchmark_solution.gif')
     else:
         print("\nGroupedLaCAM FAILED")
+        save_to_csv('results.csv', map_path, num_agents, elapsed, 0, 0,
+                solver.nodes_exp, solver.nodes_gen, False)
         # Save partial search snapshots so there is still something to inspect
         animate_mapf_search(grid_map, solver.search_snapshots, starts, goals,
                             save_path='data/logs/benchmark_search_failure.gif')
