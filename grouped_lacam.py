@@ -520,7 +520,6 @@ class GroupedLaCAM:
                     print(f"    Their positions: {[node.config[i] for i in frozen]}")
                     print(f"    Their goals:     {[self.goals[i] for i in frozen]}")
 
-            # FIX 2: cycle detected → fall back to pure LaCAM
             if new_config in explored:
                 cycle_hits += 1
                 new_config = self.pibt.plan_one_step(node.config, global_con, None)
@@ -551,7 +550,6 @@ class GroupedLaCAM:
         if self.verbose:
             print(f"\n[T{node.timestep}] Planning from config {node.config}")
 
-        # Run PIBT with GroupTracker to detect groups
         GT = GroupTracker(self.num_agents)
         for i in range(self.num_agents):
             GT.gid[i] = i
